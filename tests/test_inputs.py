@@ -257,3 +257,29 @@ def test_cover_runs_past_page_top_links_and_stops_at_the_contents():
     cover = " ".join(b.text for b in sel.cover)
     assert "15,115,823,000 shares outstanding" in cover
     assert "Risk Factors" not in cover and "Item 7. Management" not in cover
+
+
+def test_cover_paragraph_wrapping_the_rest_of_the_document_is_cut_at_part_one():
+    """Some filings wrap everything after the cover's last paragraph in one inline element, so
+    that paragraph's own text is the whole document (270K characters in VTR-2019)."""
+    wrap = (
+        "<div>DOCUMENTS INCORPORATED BY REFERENCE <span>Portions of the proxy statement are incorporated "
+        "into Part III. <div>PART I</div><div>Item 1. Business " + "We make things. " * 1000 + "</div></span></div>"
+    )
+    doc = DOC.replace(b"<div>TABLE OF CONTENTS</div>", wrap.encode() + b"<div>TABLE OF CONTENTS</div>")
+    built = inputs.build(doc)
+    cover = " ".join(b.text for b in built.selection.cover)
+    assert "15,115,823,000 shares outstanding" in cover
+    assert "We make things" not in cover and len(cover) < inputs.COVER_CHARS
+    assert "## Income statement" in built.text  # the statements are still found
+
+
+def test_date_near_prefers_the_counts_own_sentence():
+    line = (
+        "The aggregate market value held by non-affiliates on March 31, 2022 was approximately $32.5 billion. "
+        "114,844,152 shares of Common Stock, par value $1 per share, were outstanding on October 31, 2022."
+    )
+    assert inputs.date_near(line, "114,844,152") == "2022-10-31"
+    row = "Common Stock, $0.01 par value | 441,823,811 | September 28, 2021"
+    assert inputs.date_near(row, "441,823,811") == "2021-09-28"
+    assert inputs.date_near("As of the date below\n441,823,811 shares", "441,823,811") is None

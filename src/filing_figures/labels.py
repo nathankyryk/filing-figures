@@ -45,7 +45,14 @@ FIELDS: tuple[Field, ...] = (
             "us-gaap:SalesRevenueServicesNet",
         ),
     ),
-    Field("net_income", "USD", "year", ("us-gaap:NetIncomeLoss", "us-gaap:ProfitLoss")),
+    # Net income attributable to the company. Some filers (e.g. American Tower) tag that line only
+    # as "available to common stockholders"; ProfitLoss (including noncontrolling interests) is last.
+    Field(
+        "net_income",
+        "USD",
+        "year",
+        ("us-gaap:NetIncomeLoss", "us-gaap:NetIncomeLossAvailableToCommonStockholdersBasic", "us-gaap:ProfitLoss"),
+    ),
     Field(
         "eps_diluted",
         "USD/shares",
@@ -71,7 +78,6 @@ FIELD_NAMES = tuple(f.name for f in FIELDS)
 # value of the right tag is a "wrong period".
 LOOKALIKES: tuple[str, ...] = (
     "us-gaap:EarningsPerShareBasic",
-    "us-gaap:NetIncomeLossAvailableToCommonStockholdersBasic",
     "us-gaap:NetIncomeLossAttributableToNoncontrollingInterest",
     "us-gaap:IncomeLossFromContinuingOperations",
     "us-gaap:ComprehensiveIncomeNetOfTax",

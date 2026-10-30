@@ -272,8 +272,49 @@ class Selection:
     how: dict[str, str] = field(default_factory=dict)  # name -> "title" | "structure"
 
 
+MONTHS = "January|February|March|April|May|June|July|August|September|October|November|December"
+DATE_TEXT = re.compile(rf"\b({MONTHS})\s+(\d{{1,2}}),?\s+(\d{{4}})", I)
+
+
+SENTENCE_END = re.compile(r"[.;]\s+(?=[A-Z0-9])")
+
+
+def date_near(text: str, needle: str, window: int = 250) -> str | None:
+    """The date printed closest to `needle`, as YYYY-MM-DD: the cover's "as of" date for the share
+    count (companies' tagged dates are sometimes days off the printed one). A date in the count's
+    own sentence wins; otherwise the closest on its line. (The sentence before is often the market
+    value "on March 31", closer to the count than its own "outstanding on October 31".)"""
+    from datetime import datetime
+
+    i = text.find(needle)
+    if i < 0:
+        return None
+    start = text.rfind("\n", 0, i) + 1
+    end = text.find("\n", i)
+    line = text[start : end if end >= 0 else len(text)]
+    pos = i - start
+    cuts = [m.end() for m in SENTENCE_END.finditer(line)]
+    sentence = (max((c for c in cuts if c <= pos), default=0), min((c for c in cuts if c > pos), default=len(line)))
+    for lo, hi in (sentence, (0, len(line))):
+        best = None
+        for m in DATE_TEXT.finditer(line, lo, hi):
+            d = min(abs(m.start() - pos), abs(m.end() - pos))
+            if d <= window and (best is None or d < best[0]):
+                best = (d, m)
+        if best is not None:
+            try:
+                return datetime.strptime(" ".join(best[1].groups()), "%B %d %Y").date().isoformat()
+            except ValueError:
+                return None
+    return None
+
+
+# "PART I" anywhere, also when run into "Item 1" with no space between; not "Part III" or "Part IV"
+PART_ONE = re.compile(r"\bpart\s+i(?=item|\W|$)", I)
+
+
 def _cover(bs: list[Block]) -> list[Block]:
-    out, size = [], 0
+    out, size, wrapper = [], 0, None
     for b in bs:
         if b.kind == "text" and COVER_END.search(b.text):
             break
@@ -281,8 +322,18 @@ def _cover(bs: list[Block]) -> list[Block]:
             break
         if size > COVER_CHARS:
             break
+        if b.kind == "text" and len(b.text) > COVER_CHARS:
+            # An element wrapping the rest of the document through inline tags (seen in FY2019-2020
+            # filings, up to 280K characters): its flattened text repeats the blocks that follow
+            # it, which are read one by one instead.
+            wrapper = wrapper or b
+            continue
         out.append(b)
         size += len(b.text)
+    if wrapper is not None and size < 500:
+        # Nothing but the wrapper: keep its start, up to "PART I" or the cap
+        m = PART_ONE.search(wrapper.text)
+        out.append(Block("text", wrapper.el, wrapper.text[: min(m.start() if m else COVER_CHARS, COVER_CHARS)]))
     return out
 
 
