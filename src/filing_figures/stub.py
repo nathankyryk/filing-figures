@@ -78,13 +78,17 @@ class _Handler(BaseHTTPRequestHandler):
         text = body["messages"][-1]["content"]
         rec = self.server.records.get(_key(text))
         content = answer(rec, self.server.mode) if rec else "unknown filing"
+        usage = {"prompt_tokens": len(text) // 4, "completion_tokens": len(content) // 4, "total_tokens": 0}
+        if body.get("stream"):
+            self._stream(body, content, usage)
+            return
         resp = {
             "id": "stub",
             "object": "chat.completion",
             "created": 0,
             "model": body.get("model", "stub"),
             "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": len(text) // 4, "completion_tokens": len(content) // 4, "total_tokens": 0},
+            "usage": usage,
         }
         data = json.dumps(resp).encode()
         self.send_response(200)
@@ -92,6 +96,21 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _stream(self, body: dict, content: str, usage: dict) -> None:
+        """Server-sent events, as vLLM streams: content chunks, then a usage-only chunk."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        base = {"id": "stub", "object": "chat.completion.chunk", "created": 0, "model": body.get("model", "stub")}
+        pieces = [content[i : i + 40] for i in range(0, len(content), 40)] or [""]
+        for i, piece in enumerate(pieces):
+            last = i == len(pieces) - 1
+            choice = {"index": 0, "delta": {"content": piece}, "finish_reason": "stop" if last else None}
+            self.wfile.write(f"data: {json.dumps(base | {'choices': [choice]})}\n\n".encode())
+        if (body.get("stream_options") or {}).get("include_usage"):
+            self.wfile.write(f"data: {json.dumps(base | {'choices': [], 'usage': usage})}\n\n".encode())
+        self.wfile.write(b"data: [DONE]\n\n")
 
     def log_message(self, *args):  # quiet
         pass

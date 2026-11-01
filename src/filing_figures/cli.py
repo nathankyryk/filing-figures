@@ -13,7 +13,7 @@ app = typer.Typer(no_args_is_help=True, add_completion=False)
 DATA = Path("data")
 
 
-OUT = Path("outputs")
+OUT = Path(os.environ.get("FIGURES_OUT", "outputs"))  # the pod's check stage writes to outputs/check
 HANDCHECK = Path("labels") / "handcheck.csv"
 HF_DATASET = "kyryk/filing-figures"
 
@@ -257,10 +257,8 @@ def predict(
 ) -> None:
     """Ask a model about each filing (outputs/preds/<split>/<run>.jsonl), then score it."""
     import json
-    from datetime import UTC, datetime
 
     from filing_figures.client import Config
-    from filing_figures.client import predict as run_predict
 
     if split == "test" and not final:
         raise typer.BadParameter("the test split is for the final runs only: pass --final")
@@ -276,6 +274,15 @@ def predict(
         max_cost=max_cost,
         extra_body=json.loads(extra) if extra else {},
     )
+    _predict_and_score(cfg, split, run, sample, seed, ids)
+
+
+def _predict_and_score(cfg, split: str, run: str, sample: int | None, seed: int, ids: str | None) -> None:
+    import json
+    from datetime import UTC, datetime
+
+    from filing_figures.client import predict as run_predict
+
     recs = _records(split, sample, seed, ids)
     out = _preds_path(split, run)
     if split == "test":
@@ -425,6 +432,299 @@ def stub(
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+
+
+# --- GPU pod commands (scripts/run_gpu_jobs.sh runs these; each names the environment it needs) ---
+
+
+def short_name(model: str) -> str:
+    """Run-name form of a model id: Qwen/Qwen3.5-4B -> qwen3.5-4b."""
+    return model.rstrip("/").split("/")[-1].lower()
+
+
+def _write_json(path: Path, obj) -> None:
+    import json
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, indent=1), encoding="utf-8")
+
+
+def _gpu_name() -> str:
+    import shutil
+    import subprocess
+
+    smi = shutil.which("nvidia-smi")
+    if not smi:
+        return ""
+    out = subprocess.run(
+        [smi, "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True, check=False
+    )
+    return out.stdout.strip().splitlines()[0] if out.stdout.strip() else ""
+
+
+@app.command()
+def doctor() -> None:
+    """Check the machine before GPU work: GPU, CUDA, data, HF token, disk, installed packages."""
+    import importlib.util
+    import shutil
+    import subprocess
+
+    failures = 0
+
+    def check(name: str, ok: bool, detail: str = "", critical: bool = True) -> None:
+        nonlocal failures
+        failures += (not ok) and critical
+        typer.echo(f"{'OK ' if ok else '!! '} {name:20s} {detail}")
+
+    smi = shutil.which("nvidia-smi")
+    if smi:
+        q = "--query-gpu=name,memory.total,driver_version"
+        out = subprocess.run(
+            [smi, q, "--format=csv,noheader"], capture_output=True, text=True, check=False
+        ).stdout.strip()
+        check("GPU", bool(out), out)
+    else:
+        check("GPU", False, "no nvidia-smi (fine on the laptop)", critical=False)
+    if importlib.util.find_spec("torch"):
+        import torch
+
+        cuda = torch.cuda.is_available()
+        detail = f"torch {torch.__version__}, CUDA {torch.version.cuda}"
+        if cuda:
+            detail += f", {torch.cuda.get_device_name(0)}, bf16 {torch.cuda.is_bf16_supported()}"
+        check("torch sees the GPU", cuda, detail, critical=bool(smi))
+    for split in ("train", "valid", "test"):
+        p = DATA / "export" / f"{split}.jsonl"
+        n = sum(1 for line in p.open(encoding="utf-8") if line.strip()) if p.exists() else 0
+        check(f"data: {split}", n > 0, f"{n} filings in {p}")
+    if os.environ.get("HF_TOKEN"):
+        try:
+            from huggingface_hub import HfApi
+
+            who = HfApi(token=os.environ["HF_TOKEN"]).whoami()["name"]
+            check("HF token", who == "kyryk", f"account {who}")
+        except Exception as e:  # noqa: BLE001 - reported, never printed with the token
+            check("HF token", False, type(e).__name__)
+    else:
+        check("HF token", False, "HF_TOKEN is not set")
+    for pkg in ("unsloth", "llmcompressor", "vllm"):
+        found = importlib.util.find_spec(pkg) is not None
+        check(f"package {pkg}", True, "installed" if found else "not in this environment", critical=False)
+    free = shutil.disk_usage(Path.cwd()).free / 1e9
+    check("disk", free > 60, f"{free:.0f} GB free")
+    raise typer.Exit(1 if failures else 0)
+
+
+@app.command("fetch-data")
+def fetch_data() -> None:
+    """Download the exported splits from the Hugging Face dataset (as last pushed)."""
+    from filing_figures.runs import fetch_dataset
+
+    for p in fetch_dataset(DATA / "export"):
+        typer.echo(f"{p}: {sum(1 for line in p.open(encoding='utf-8') if line.strip())} filings")
+
+
+@app.command("vllm-predict")
+def vllm_predict(
+    model: str = typer.Option(..., help="HF repo id or a local model folder"),
+    run: str = typer.Option(..., help="Run name (also the served model name)"),
+    split: str = typer.Option("valid", help="train, valid or test (test needs --final)"),
+    sample: int = typer.Option(None, help="A seeded sample of N filings"),
+    seed: int = typer.Option(0, help="Sampling seed"),
+    thinking: bool = typer.Option(False, help="Let the model reason before answering"),
+    schema: bool = typer.Option(False, "--schema/--no-schema", help="Constrained decoding with the JSON schema"),
+    max_tokens: int = typer.Option(None, help="Output cap (default 2048, or 16000 when thinking)"),
+    workers: int = typer.Option(64, help="Requests in flight"),
+    port: int = typer.Option(8000),
+    final: bool = typer.Option(False, help="Allow the test split; the run is logged"),
+) -> None:
+    """Serve a model with vLLM, ask it about each filing, score it, stop the server. (serve environment)"""
+    import time
+
+    from filing_figures.client import Config
+    from filing_figures.vllm_server import MAX_MODEL_LEN, THINKING_MAX_MODEL_LEN, running
+
+    if split == "test" and not final:
+        raise typer.BadParameter("the test split is for the final runs only: pass --final")
+    t0 = time.time()
+    max_len = THINKING_MAX_MODEL_LEN if thinking else MAX_MODEL_LEN
+    with running(
+        model, run, OUT / "logs" / "vllm" / f"{run}.log", port=port, max_model_len=max_len, thinking=thinking
+    ) as (
+        url,
+        stats,
+    ):
+        startup_s = time.time() - t0
+        cfg = Config(
+            endpoint=url,
+            model=run,
+            max_tokens=max_tokens or (16_000 if thinking else 2048),
+            schema=schema,
+            reasoning="on" if thinking else "off",
+            workers=workers,
+            timeout=1800.0,  # a long thinking answer, queued behind 63 others
+        )
+        t1 = time.time()
+        _predict_and_score(cfg, split, run, sample, seed, None)
+        info = {"model": model, "split": split, "gpu": _gpu_name(), "startup_s": round(startup_s, 1)}
+        _write_json(OUT / "serve" / f"{run}.json", info | {"predict_s": round(time.time() - t1, 1), **stats})
+
+
+@app.command()
+def train(
+    base: str = typer.Option(..., help="Base model repo, e.g. Qwen/Qwen3.5-4B"),
+    name: str = typer.Option(None, help="Run name (default: ft-<base>)"),
+    epochs: float = typer.Option(3.0),
+    rank: int = typer.Option(16),
+    alpha: int = typer.Option(32),
+    lr: float = typer.Option(2e-4),
+    grad_accum: int = typer.Option(16, help="Filings per optimizer step"),
+    max_steps: int = typer.Option(-1, help="> 0: a timing run (check stage)"),
+    four_bit: bool | None = typer.Option(
+        None, "--four-bit/--bf16", help="Default: QLoRA where supported (train.FOUR_BIT)"
+    ),
+) -> None:
+    """LoRA fine-tune on the train split; adapters every half epoch in outputs/train/<name>. (train environment)"""
+    from filing_figures.train import TrainConfig
+    from filing_figures.train import train as run_train
+
+    name = name or f"ft-{short_name(base)}"
+    cfg = TrainConfig(
+        base=base,
+        out=OUT / "train" / name,
+        epochs=epochs,
+        rank=rank,
+        alpha=alpha,
+        lr=lr,
+        grad_accum=grad_accum,
+        max_steps=max_steps,
+        load_in_4bit=four_bit,
+    )
+    meta = run_train(cfg, _records("train"), _records("valid"))
+    typer.echo({k: meta[k] for k in ("steps", "seconds_per_step", "peak_gpu_gib", "train_loss", "dropped_too_long")})
+
+
+@app.command()
+def merge(
+    adapter: Path = typer.Option(..., help="A checkpoint folder of a `train` run"),
+    out: Path = typer.Option(..., help="Folder for the merged bf16 model"),
+) -> None:
+    """Merge an adapter into its base model's weights (bf16), ready for vLLM. (train environment)"""
+    from filing_figures.train import merge as run_merge
+
+    typer.echo(run_merge(adapter, out))
+
+
+@app.command()
+def checkpoints(name: str = typer.Option(..., help="Run name of a `train` run")) -> None:
+    """Print a training run's checkpoint folders, in step order (for the stage scripts)."""
+    from filing_figures.train import checkpoints as find
+
+    for p in find(OUT / "train" / name):
+        typer.echo(p.as_posix())
+
+
+def _summary(split: str, run: str) -> dict | None:
+    import json
+
+    p = OUT / "scores" / split / f"{run}.json"
+    return json.loads(p.read_text(encoding="utf-8"))["summary"] if p.exists() else None
+
+
+@app.command("pick-base")
+def pick_base(models: str = typer.Option(",".join(CANDIDATE_TOKENIZERS), help="Comma-separated candidates")) -> None:
+    """The bake-off's winner from the validation scores of runs base-<model> (rule: picks.py)."""
+    from filing_figures.picks import pick_base as choose
+
+    scores = {m: s for m in models.split(",") if (s := _summary("valid", f"base-{short_name(m)}"))}
+    winner = choose(scores)
+    rows = {m: round(100 * s["overall"]["value"], 1) for m, s in scores.items()}
+    _write_json(OUT / "bakeoff" / "winner.json", {"winner": winner, "overall_pct": rows})
+    typer.echo(f"scores {rows}")
+    typer.echo(winner)
+
+
+@app.command("pick-checkpoint")
+def pick_checkpoint(name: str = typer.Option(..., help="Run name of a `train` run")) -> None:
+    """The best checkpoint on validation (runs <name>-step<N>); writes outputs/train/<name>/best.json."""
+    from filing_figures.picks import pick_checkpoint as choose
+    from filing_figures.train import checkpoints as find
+
+    paths = {int(p.name.split("-")[1]): p for p in find(OUT / "train" / name)}
+    scores = {step: s for step in paths if (s := _summary("valid", f"{name}-step{step}"))}
+    step = choose(scores)
+    best = {
+        "step": step,
+        "checkpoint": paths[step].as_posix(),
+        "run": f"{name}-step{step}",
+        "overall_pct": {s: round(100 * v["overall"]["value"], 2) for s, v in sorted(scores.items())},
+    }
+    _write_json(OUT / "train" / name / "best.json", best)
+    typer.echo(best)
+
+
+@app.command()
+def quantize(
+    model: Path = typer.Option(..., help="A merged model folder"),
+    scheme: str = typer.Option(..., help="fp8, w4a16 or nvfp4"),
+    out: Path = typer.Option(None, help="Default: outputs/quant/<model>-<scheme>"),
+    calib: int = typer.Option(256, help="Training filings for calibration (w4a16, nvfp4)"),
+    seed: int = typer.Option(0),
+) -> None:
+    """Quantize with llm-compressor. (quant environment)"""
+    from filing_figures.quantize import quantize as run_quantize
+
+    out = out or OUT / "quant" / f"{model.name}-{scheme}"
+    typer.echo(run_quantize(model, scheme, out, _records("train", calib, seed)))
+
+
+@app.command()
+def bench(
+    model: str = typer.Option(..., help="HF repo id or a local model folder"),
+    run: str = typer.Option(..., help="Name for the results file"),
+    gpu_price: float = typer.Option(None, help="GPU $/hour, for the cost per 1,000 filings"),
+    port: int = typer.Option(8000),
+    quick: bool = typer.Option(False, help="Two small levels only (the check stage)"),
+) -> None:
+    """Speed of a served model: filings/s, latency, time to first token. (serve environment)"""
+    from filing_figures import bench as speed
+    from filing_figures.vllm_server import running
+
+    with running(model, run, OUT / "logs" / "vllm" / f"bench-{run}.log", port=port) as (url, stats):
+        levels = speed.run(url, run, _records("train"), levels=((1, 4), (8, 16)) if quick else speed.LEVELS)
+    best = max(lv["filings_per_s"] or 0 for lv in levels)
+    result = {"model": model, "gpu": _gpu_name(), "vllm": stats, "levels": levels, "best_filings_per_s": best}
+    if gpu_price and best:
+        result |= {
+            "gpu_price_per_hour": gpu_price,
+            "cost_per_1000_filings": round(speed.cost_per_1000(gpu_price, best), 4),
+        }
+    _write_json(OUT / "bench" / f"{run}.json", result)
+    typer.echo(
+        f"{run}: best {best} filings/s"
+        + (f", ${result['cost_per_1000_filings']} per 1,000" if "cost_per_1000_filings" in result else "")
+    )
+
+
+@app.command()
+def upload(
+    paths: list[Path] = typer.Argument(..., help="Files or folders, uploaded at the same paths"),
+    message: str = typer.Option("Pod results", help="Commit message"),
+) -> None:
+    """Upload results to the private runs repo on Hugging Face."""
+    from filing_figures.runs import RUNS_REPO
+    from filing_figures.runs import upload as push_paths
+
+    done = push_paths(paths, message)
+    typer.echo(f"uploaded to {RUNS_REPO}: {done}")
+
+
+@app.command("fetch-runs")
+def fetch_runs(patterns: list[str] = typer.Argument(..., help="Glob patterns, e.g. 'outputs/train/ft-x/*'")) -> None:
+    """Download results from the private runs repo into this folder."""
+    from filing_figures.runs import download as fetch
+
+    typer.echo(fetch(patterns))
 
 
 if __name__ == "__main__":

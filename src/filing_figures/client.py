@@ -48,8 +48,8 @@ class Config:
                 )
             if self.schema:
                 body.setdefault("provider", {"require_parameters": True})  # only providers that honour the schema
-        elif self.reasoning == "off":  # vLLM: Qwen-style chat templates take this switch
-            body.setdefault("chat_template_kwargs", {"enable_thinking": False})
+        elif self.reasoning:  # vLLM: the Qwen and Gemma 4 chat templates take this switch
+            body.setdefault("chat_template_kwargs", {"enable_thinking": self.reasoning != "off"})
         return body
 
 
