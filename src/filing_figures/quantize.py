@@ -71,7 +71,14 @@ def quantize(model_dir: Path, scheme: str, out_dir: Path, calib_recs: list[dict]
         ds = Dataset.from_dict(
             {"input_ids": [e["input_ids"] for e in enc], "attention_mask": [e["attention_mask"] for e in enc]}
         )
-        kwargs = {"dataset": ds, "max_seq_length": max_seq_length, "num_calibration_samples": len(enc)}
+        # Our tokenizer as the processor: otherwise llm-compressor loads the model's full
+        # AutoProcessor, which for Qwen3.5 includes a video processor that needs torchvision.
+        kwargs = {
+            "dataset": ds,
+            "processor": tok,
+            "max_seq_length": max_seq_length,
+            "num_calibration_samples": len(enc),
+        }
     oneshot(model=model, recipe=recipe, **kwargs)
     if out_dir.exists():
         shutil.rmtree(out_dir)

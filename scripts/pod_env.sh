@@ -31,10 +31,16 @@ export HF_HUB_DISABLE_PROGRESS_BARS=1  # keeps the logs readable
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Each GPU extra has its own environment (vLLM and Unsloth pin different torch versions):
+# Each GPU extra has its own environment (vLLM and Unsloth pin different torch versions), on
+# the container disk: /workspace can be a network filesystem, where importing vLLM took 50 s
+# instead of 11 s (measured 2026-11-01, EUR-NO-1). The container disk is wiped when the pod
+# stops; run_gpu_jobs.sh re-creates missing environments from the uv cache (~1 min each).
+export VENV_ROOT="${VENV_ROOT:-/root/venvs}"
+venv_dir() { echo "$VENV_ROOT/$1"; }
+
 #   in_env train figures train ...
 in_env() {
   local extra=$1
   shift
-  UV_PROJECT_ENVIRONMENT="$REPO_DIR/.venv-$extra" uv run --no-sync "$@"
+  UV_PROJECT_ENVIRONMENT="$(venv_dir "$extra")" uv run --no-sync "$@"
 }

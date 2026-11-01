@@ -14,6 +14,7 @@ wheels/
 data/
 weights/
 outputs/
+unsloth_compiled_cache/
 
 # Secrets
 .env

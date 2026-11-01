@@ -22,7 +22,8 @@ dependencies = [
 
 [project.optional-dependencies]
 # GPU pod only (Linux + CUDA 13). vLLM and Unsloth pin different torch versions, so each extra
-# is its own environment: UV_PROJECT_ENVIRONMENT=.venv-<extra> uv sync --extra <extra>
+# is its own environment: UV_PROJECT_ENVIRONMENT=<dir> uv sync --extra <extra> (on the pod,
+# scripts/pod_env.sh puts them in /root/venvs/<extra>)
 train = [
     "unsloth==2026.10.11; sys_platform == 'linux'",
     "unsloth-zoo==2026.10.11; sys_platform == 'linux'",

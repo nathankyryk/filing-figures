@@ -65,7 +65,7 @@ uv --version
 
 for extra in $ENVS; do
   step "Environment: $extra (exactly as uv.lock)"
-  UV_PROJECT_ENVIRONMENT="$REPO_DIR/.venv-$extra" uv sync --frozen --no-dev --extra "$extra"
+  UV_PROJECT_ENVIRONMENT="$(venv_dir "$extra")" uv sync --frozen --no-dev --extra "$extra"
   in_env "$extra" python - <<'EOF'
 import torch
 assert torch.cuda.is_available(), "PyTorch cannot see the GPU"

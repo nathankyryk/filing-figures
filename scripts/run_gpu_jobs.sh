@@ -240,11 +240,9 @@ test_steps() {
 
 export FIGURES_OUT=outputs
 run "update code" git pull --ff-only || true
-for extra in train quant serve; do
-  if [ -d ".venv-$extra" ]; then
-    run "sync $extra environment" env UV_PROJECT_ENVIRONMENT="$REPO_DIR/.venv-$extra" \
-      uv sync --frozen --no-dev --extra "$extra" || true
-  fi
+for extra in train quant serve; do # also re-creates an environment a pod restart wiped
+  run "sync $extra environment" env UV_PROJECT_ENVIRONMENT="$(venv_dir "$extra")" \
+    uv sync --frozen --no-dev --extra "$extra" || true
 done
 
 case "$stage" in
