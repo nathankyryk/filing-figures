@@ -6,7 +6,9 @@ Every answer is checked against the XBRL data each company filed with the SEC, s
 
 - **98.8%** of figures right on companies the model never saw in training (95.4% before fine-tuning).
 - **Ties Qwen3.5-397B** (98.7%) and comes within 1.2 points of **Claude Opus 5.5** (100%).
-- **$0.07 per 1,000 filings** served in 4-bit on one RTX 5090, vs $3.66 for Qwen3.5-397B and $29.86 for Opus.
+- **$0.07 per 1,000 filings** served in 4-bit on one RTX 5090, vs $3.66 for Qwen3.5-397B and $29.84 for Opus.
+
+**Links:** [browse every answer](https://huggingface.co/spaces/kyryk/filing-figures) · [model](https://huggingface.co/kyryk/filing-figures-qwen3.5-4b-nvfp4) · [LoRA adapter](https://huggingface.co/kyryk/filing-figures-qwen3.5-4b-lora) · [dataset](https://huggingface.co/datasets/kyryk/filing-figures)
 
 ## Results
 
@@ -19,7 +21,7 @@ Test set: 207 filings from 36 companies, none of them seen during training or tu
 | Qwen3.5-4B, fine-tuned | 98.4% | 91% | $0.10 |
 | **Qwen3.5-4B, fine-tuned, 4-bit (NVFP4)** | **98.8%** | **93%** | **$0.07** |
 | Qwen3.5-397B (open model, ~100× bigger) | 98.7% | 93% | $3.66 |
-| Claude Opus 5.5 (frontier) | 100.0% | 100% | $29.86 |
+| Claude Opus 5.5 (frontier) | 100.0% | 100% | $29.84 |
 
 How sure are these numbers? Gaps between models, with 95% intervals from resampling companies:
 
@@ -80,10 +82,10 @@ Zero-shot (no fine-tuning) on 214 validation filings, 1,237 figures:
 
 | Model | Figures right | Main mistake |
 |---|---|---|
-| **Qwen3.5-4B** | **96.6%** | An extra zero when writing out the number (28 of 42 misses) |
+| **Qwen3.5-4B** | **96.6%** | Off by 10× when writing out the number (29 of 42 misses) |
 | Qwen3.5-9B | 95.3% | Forgets to apply "in millions" (49 of 58 misses) |
-| Gemma 4 E4B | 91.9% | One or two extra zeros (74 of 100 misses) |
-| Qwen3-8B | 65.6% | An extra zero, e.g. 5,794 million → 57.9 billion (354 of 425 misses) |
+| Gemma 4 E4B | 91.9% | Off by 10× or 100× (80 of 100 misses) |
+| Qwen3-8B | 65.6% | Off by 10×, e.g. 5,794 million → 57.9 billion (360 of 425 misses) |
 
 The rule: take the best model, but if a smaller one is within the best one's 95% interval, take the smaller one. Here the smallest model also had the highest score, so Qwen3.5-4B won outright.
 
@@ -120,7 +122,7 @@ Its 14 wrong figures on test (of 1,186) come from just **4 companies**, and almo
 
 ## Other findings
 
-- **Fine-tuning removed the extra-zero slips.** They were 24 of the base model's 54 misses on test, and the fine-tuned model made none.
+- **Fine-tuning removed the off-by-10× slips.** They were 24 of the base model's 54 misses on test; the fine-tuned model made none.
 - **"Thinking" mode isn't worth it here.** With reasoning on, the base 4B got 1,182 of the 1,183 figures it answered right. But it wrote about 11× more tokens (median 4,400), took a median of 2 minutes per filing, and gave no usable answer on 10 of 214 filings. Fine-tuning reached that accuracy without the cost.
 - **Forcing JSON with a schema changed nothing.** Without one, every non-thinking model already returned valid JSON on all 214 validation filings.
 - **Fine-tuning shortened the answers** from about 400 to 315 tokens, and the model ran 10% faster.
@@ -129,7 +131,7 @@ Its 14 wrong figures on test (of 1,186) come from just **4 companies**, and almo
 ## Limitations
 
 - **36 test companies is not many.** Errors cluster by company (see above), so intervals are a few points wide.
-- **Some fields are left unscored:** companies with several share classes have no single share count, and statements the input builder couldn't find (about 4% of test figures) aren't scored.
+- **Some figures are left unscored:** companies with several share classes have no single share count, and a figure the input builder didn't capture isn't scored. Filings with more than two such figures were dropped (7 of 214 test filings).
 - **Definitions are conventions.** Revenue with or without "other income", net income before or after preferred dividends: the key follows each company's primary XBRL tags.
 - **Data coverage:** non-financial S&P 500 companies, 10-Ks from 2019–2024 only.
 - **The large API models may have seen these filings in training.** That wasn't tested.
@@ -142,6 +144,33 @@ Its 14 wrong figures on test (of 1,186) come from just **4 companies**, and almo
 | OpenRouter: prompt tuning and Qwen3.5-397B | ~$1.20 |
 | OpenRouter: Claude Opus 5.5 on the test set | $6.18 |
 | **Total** | **~$12** |
+
+## Try it on any 10-K
+
+`figures extract` fetches a filing from SEC EDGAR, builds the same input as the dataset, asks a model and scores each figure against the company's XBRL. Serve the fine-tuned model with vLLM (NVFP4 needs a Blackwell GPU, e.g. an RTX 5090):
+
+```bash
+vllm serve kyryk/filing-figures-qwen3.5-4b-nvfp4 --served-model-name filing-figures   --max-model-len 12288 --language-model-only --default-chat-template-kwargs '{"enable_thinking": false}'
+uv run figures extract --ticker SBUX --year 2025 --endpoint http://localhost:8000/v1 --model filing-figures
+```
+
+Any OpenAI-compatible endpoint works. Here it runs on Starbucks' FY2025 10-K, filed after the dataset was built, with Qwen3.5-9B through OpenRouter:
+
+```
+$ uv run figures extract --ticker SBUX --year 2025 --endpoint openrouter --model qwen/qwen3.5-9b
+SBUX FY2025 10-K (accession 0000829224-25-000114, filed 2025-11-14): 15,055 characters of statements
+qwen/qwen3.5-9b: answered in 11.3 s
+
+field                         model  period end  XBRL (answer key)  period end
+revenue              37,184,400,000  2025-09-28     37,184,400,000  2025-09-28  right
+net_income            1,856,400,000  2025-09-28      1,856,400,000  2025-09-28  right
+eps_diluted                    1.63  2025-09-28               1.63  2025-09-28  right
+total_assets         32,019,700,000  2025-09-28     32,019,700,000  2025-09-28  right
+shares_outstanding    1,137,100,000  2025-11-07      1,137,100,000  2025-11-07  right
+operating_cash_flow   4,747,500,000  2025-09-28      4,747,500,000  2025-09-28  right
+
+6/6 right
+```
 
 ## Run it yourself
 
@@ -165,6 +194,9 @@ uv run figures score --run q397b --split valid --sample 20
 
 # Check the answer key by hand (a local web page)
 uv run figures review
+
+# Build the results viewer's data (space/) from the test predictions
+uv run figures space
 ```
 
 The GPU stages run on a rented Linux GPU with CUDA 13 (an RTX 5090 here). Each stage uploads its results to a Hugging Face repo, then stops the pod:
@@ -191,7 +223,10 @@ HANDCHECK_DONE=1 QUANT=nvfp4 bash scripts/run_gpu_jobs.sh test    # ~20 min: the
 | `evaluate.py`, `rules.py`, `review.py` | Scoring, error types and confidence intervals; the rules baseline; the hand-check page |
 | `sft.py`, `train.py`, `merge.py` | Training examples, LoRA training, merging the adapter into the model |
 | `quantize.py`, `vllm_server.py`, `bench.py` | 4-bit and 8-bit versions, serving, speed tests |
+| `extract.py`, `space.py` | `figures extract` (any 10-K, any model); the results viewer's data |
 | `scripts/` | Pod setup and the GPU stages |
+| `space/` | The results viewer (a static Hugging Face Space) |
+| `hf/` | The Hugging Face dataset and model cards |
 | `labels/handcheck.csv` | The hand-check verdicts |
 
 ## License

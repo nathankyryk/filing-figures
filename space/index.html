@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FilingFigures Results</title>
+<meta name="description" content="Six financial figures from 207 SEC 10-K filings: each model's answers next to the XBRL answer key.">
+<style>
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --ink: #1c1d1f; --muted: #62656b; --line: #e3e3df;
+  --accent: #2f5fd0; --accent-soft: #e8eefb;
+  --ok: #1f7a4d; --ok-soft: #e6f4ec; --bad: #b42318; --bad-soft: #fdecea; --none: #9a9ca1;
+  --mark: #fff1b8; --mark-ink: #1c1d1f;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #131416; --panel: #1b1c1f; --ink: #e8e8e6; --muted: #9da0a6; --line: #2c2e32;
+    --accent: #7ea2f5; --accent-soft: #1e2a45;
+    --ok: #5cc493; --ok-soft: #15301f; --bad: #f2877c; --bad-soft: #3a1a17; --none: #6c6f75;
+    --mark: #5a4a12; --mark-ink: #fff5cf;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #131416; --panel: #1b1c1f; --ink: #e8e8e6; --muted: #9da0a6; --line: #2c2e32;
+  --accent: #7ea2f5; --accent-soft: #1e2a45;
+  --ok: #5cc493; --ok-soft: #15301f; --bad: #f2877c; --bad-soft: #3a1a17; --none: #6c6f75;
+  --mark: #5a4a12; --mark-ink: #fff5cf;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+a { color: var(--accent); }
+.wrap { max-width: 1440px; margin: 0 auto; padding: 28px 16px 48px; }
+header h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -0.01em; }
+header p { margin: 0; color: var(--muted); max-width: 820px; }
+.links { margin-top: 10px; display: flex; gap: 16px; flex-wrap: wrap; font-size: 14px; }
+h2 { font-size: 16px; margin: 32px 0 10px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+tr:last-child td { border-bottom: 0; }
+td.num, th.num { text-align: right; }
+#results tbody tr { cursor: pointer; }
+#results tbody tr:hover { background: var(--accent-soft); }
+#results tbody tr.focus { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
+.bar { display: inline-block; height: 6px; border-radius: 3px; background: var(--accent); vertical-align: middle; margin-left: 8px; opacity: 0.8; }
+.ci { color: var(--muted); font-size: 12px; margin-left: 4px; }
+.note { color: var(--muted); font-size: 13px; margin: 8px 2px 0; }
+.controls { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: end; margin-bottom: 12px; }
+.controls label { display: flex; flex-direction: column; font-size: 12px; color: var(--muted); gap: 4px; }
+.controls label.check { flex-direction: row; align-items: center; gap: 6px; font-size: 14px; color: var(--ink); padding-bottom: 6px; }
+select, input[type="search"] {
+  font: inherit; font-size: 14px; color: var(--ink); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 7px; padding: 6px 8px; min-width: 150px;
+}
+.count { color: var(--muted); font-size: 13px; margin-left: auto; padding-bottom: 6px; }
+.browse { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+.browse > * { min-width: 0; }
+@media (min-width: 1100px) { .browse { grid-template-columns: 390px minmax(0, 1fr); } }
+.list { max-height: 72vh; overflow: auto; }
+.list table th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+.list td, .list th { padding: 6px 5px; }
+.list th { text-transform: none; letter-spacing: 0; font-size: 12px; }
+.list td:first-child, .list th:first-child { padding-left: 12px; }
+.list tbody tr { cursor: pointer; }
+.list tbody tr:hover { background: var(--accent-soft); }
+.list tbody tr.sel { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
+.co { font-weight: 600; }
+.co small { display: block; font-weight: 400; color: var(--muted); font-size: 12px; max-width: 130px; overflow: hidden; text-overflow: ellipsis; }
+.dot { display: inline-block; width: 21px; height: 21px; line-height: 21px; text-align: center; border-radius: 6px; font-size: 12px; font-weight: 700; }
+.dot.ok { background: var(--ok-soft); color: var(--ok); }
+.dot.bad { background: var(--bad-soft); color: var(--bad); }
+.dot.none { color: var(--none); }
+.detail { padding: 18px; min-height: 300px; }
+.detail h3 { margin: 0; font-size: 20px; }
+.meta { color: var(--muted); font-size: 13px; margin: 4px 0 14px; }
+.answers td, .answers th { vertical-align: top; padding: 7px 8px; }
+.answers th { vertical-align: bottom; }
+.answers td.cell { text-align: right; }
+.answers td.cell.bad { background: var(--bad-soft); }
+.answers td.gold { background: var(--accent-soft); text-align: right; }
+.answers .v { font-weight: 600; }
+.answers .d { display: block; font-size: 12px; color: var(--muted); }
+.answers td.bad .d.tag { color: var(--bad); font-weight: 600; }
+.answers td.cell.ok .v::before { content: "✓ "; color: var(--ok); font-weight: 700; }
+.answers th.mod { text-align: right; white-space: normal; min-width: 76px; }
+details { margin-top: 16px; }
+summary { cursor: pointer; font-weight: 600; font-size: 14px; }
+pre {
+  font: 12.5px/1.45 var(--mono); background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  padding: 12px; max-height: 60vh; overflow: auto; white-space: pre-wrap; word-break: break-word;
+}
+mark { background: var(--mark); color: var(--mark-ink); border-radius: 3px; padding: 0 2px; }
+.empty { color: var(--muted); padding: 40px 0; text-align: center; }
+@media (max-width: 640px) { .ci, .bar { display: none; } }
+footer { margin-top: 36px; color: var(--muted); font-size: 13px; max-width: 820px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>FilingFigures: test-set results</h1>
+    <p>207 SEC 10-K filings from 36 companies that no model was trained or tuned on. Each model read the same cover page and financial statements and returned six figures. Every answer is scored against the company's own XBRL data, hand-checked on 100 filings.</p>
+    <div class="links">
+      <a href="https://github.com/nathankyryk/filing-figures">Code and write-up</a>
+      <a href="https://huggingface.co/datasets/kyryk/filing-figures">Dataset</a>
+      <a href="https://huggingface.co/kyryk/filing-figures-qwen3.5-4b-nvfp4">Fine-tuned model</a>
+    </div>
+  </header>
+
+  <h2>Models</h2>
+  <div class="panel scroll">
+    <table id="results">
+      <thead><tr><th>Model</th><th class="num">Figures right</th><th class="num">All 6 right</th><th class="num">$ per 1,000 filings</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <p class="note">95% intervals from resampling companies. Click a model to browse its answers below. A figure is right when it's within 0.5% (EPS: $0.005) and its period end date is exact.</p>
+
+  <h2>Filings</h2>
+  <div class="controls">
+    <label>Model<select id="model"></select></label>
+    <label>Field<select id="field"></select></label>
+    <label>Error type<select id="cat"></select></label>
+    <label>Search<input id="q" type="search" placeholder="Ticker or company"></label>
+    <label class="check"><input id="wrong" type="checkbox"> Only wrong answers</label>
+    <span class="count" id="count"></span>
+  </div>
+  <div class="browse">
+    <div class="panel list"><table id="list"><thead></thead><tbody></tbody></table></div>
+    <div class="panel detail" id="detail"><p class="empty">Pick a filing to see every model's answers.</p></div>
+  </div>
+
+  <footer>
+    The test split was run once, after all tuning on the validation split. Fine-tuned model costs are GPU rental ($1.19/h, one RTX 5090) divided by measured throughput; API costs are what the run cost on OpenRouter. Figures that are blank in the answer key (several share classes, or a figure the input builder didn't capture) aren't scored.
+  </footer>
+</div>
+
+<script>
+const FIELD_LABEL = {
+  revenue: "Revenue", net_income: "Net income", eps_diluted: "Diluted EPS",
+  total_assets: "Total assets", shares_outstanding: "Shares outstanding", operating_cash_flow: "Operating cash flow",
+};
+const FIELD_SHORT = {
+  revenue: "Rev", net_income: "NI", eps_diluted: "EPS", total_assets: "Assets",
+  shares_outstanding: "Shares", operating_cash_flow: "OCF",
+};
+const CAT_LABEL = {
+  correct: "Right", date: "Wrong date", scale: "Wrong scale (1,000×)", off_by_10x: "Off by 10×",
+  sign: "Wrong sign", wrong_period: "Prior-year value", wrong_line_item: "Wrong line",
+  other: "Other", missing: "Missing", invalid_json: "Unreadable answer", no_response: "No answer",
+  not_scored: "Not scored",
+};
+const SHORT = {
+  "rules": "Rules", "base-qwen3.5-4b": "4B base", "ft-qwen3.5-4b-bf16": "4B tuned bf16",
+  "ft-qwen3.5-4b-nvfp4": "4B tuned NVFP4", "ref-qwen3.5-397b": "Qwen 397B", "ref-opus-5.5": "Opus 5.5",
+};
+const DEFAULT_MODEL = "ft-qwen3.5-4b-nvfp4";
+
+let DATA = null;
+const state = { model: DEFAULT_MODEL, field: "all", cat: "all", q: "", wrong: false, sel: null };
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+const pct = (x) => (x * 100).toFixed(1) + "%";
+
+function fmt(v, field) {
+  if (v === null || v === undefined) return "–";
+  if (field === "eps_diluted") return v.toFixed(2);
+  const a = Math.abs(v);
+  if (a >= 1e6) {
+    const m = v / 1e6;
+    return m.toLocaleString("en-US", { maximumFractionDigits: Math.abs(m) >= 100 ? 1 : 2 }) + "M";
+  }
+  return v.toLocaleString("en-US", { maximumFractionDigits: 0 });
+}
+const full = (v, field) => (v === null || v === undefined) ? "no value"
+  : field === "eps_diluted" ? v.toFixed(2) : v.toLocaleString("en-US", { maximumFractionDigits: 0 });
+
+function modelLabel(run) { return DATA.models.find((m) => m.run === run).label; }
+
+function renderResults() {
+  const best = Math.max(...DATA.models.map((m) => m.overall.value));
+  $("results").querySelector("tbody").innerHTML = DATA.models.map((m) => {
+    const cost = m.cost_per_1000 === 0 ? "$0" : "$" + (m.cost_per_1000 < 1 ? m.cost_per_1000.toFixed(3) : m.cost_per_1000.toFixed(2));
+    const w = Math.max(4, Math.round(((m.overall.value - 0.9) / (best - 0.9)) * 90));
+    return `<tr data-run="${m.run}" class="${m.run === state.model ? "focus" : ""}">
+      <td>${esc(m.label)}</td>
+      <td class="num">${pct(m.overall.value)}<span class="ci">[${(m.overall.lo * 100).toFixed(1)}, ${(m.overall.hi * 100).toFixed(1)}]</span><span class="bar" style="width:${w}px"></span></td>
+      <td class="num">${pct(m.all_right.value)}</td>
+      <td class="num">${cost}</td></tr>`;
+  }).join("");
+}
+
+function answerOf(f, field) { return f.fields[field].answers[state.model]; }
+function isWrong(a) { return a.category !== "correct" && a.category !== "not_scored"; }
+
+function filtered() {
+  const q = state.q.trim().toLowerCase();
+  const fields = state.field === "all" ? DATA.fields : [state.field];
+  return DATA.filings.filter((f) => {
+    if (q && !(f.ticker.toLowerCase().includes(q) || f.name.toLowerCase().includes(q))) return false;
+    const answers = fields.map((k) => answerOf(f, k));
+    if (state.cat !== "all" && !answers.some((a) => a.category === state.cat)) return false;
+    if (state.wrong && !answers.some(isWrong)) return false;
+    return true;
+  });
+}
+
+function renderCats() {
+  const counts = {};
+  const fields = state.field === "all" ? DATA.fields : [state.field];
+  for (const f of DATA.filings) for (const k of fields) {
+    const c = answerOf(f, k).category;
+    if (c !== "correct" && c !== "not_scored") counts[c] = (counts[c] || 0) + 1;
+  }
+  const opts = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  if (state.cat !== "all" && !counts[state.cat]) state.cat = "all";
+  $("cat").innerHTML = `<option value="all">Any (${opts.reduce((s, x) => s + x[1], 0)} wrong)</option>` +
+    opts.map(([c, n]) => `<option value="${c}" ${c === state.cat ? "selected" : ""}>${CAT_LABEL[c] || c} (${n})</option>`).join("");
+}
+
+function renderList() {
+  const rows = filtered();
+  const fields = state.field === "all" ? DATA.fields : [state.field];
+  $("count").textContent = `${rows.length} of ${DATA.filings.length} filings`;
+  $("list").querySelector("thead").innerHTML =
+    `<tr><th>Filing</th>${fields.map((k) => `<th title="${FIELD_LABEL[k]}">${FIELD_SHORT[k]}</th>`).join("")}</tr>`;
+  $("list").querySelector("tbody").innerHTML = rows.map((f) => {
+    const cells = fields.map((k) => {
+      const a = answerOf(f, k);
+      if (a.category === "not_scored") return `<td><span class="dot none" title="Not scored">–</span></td>`;
+      if (a.category === "correct") return `<td><span class="dot ok" title="${FIELD_LABEL[k]}: right">✓</span></td>`;
+      return `<td><span class="dot bad" title="${FIELD_LABEL[k]}: ${CAT_LABEL[a.category] || a.category}">✗</span></td>`;
+    }).join("");
+    return `<tr data-id="${f.id}" class="${f.id === state.sel ? "sel" : ""}">
+      <td class="co">${esc(f.ticker)} FY${f.fiscal_year}<small>${esc(f.name)}</small></td>${cells}</tr>`;
+  }).join("") || `<tr><td colspan="7" class="empty">No filings match.</td></tr>`;
+}
+
+function highlight(text, needles) {
+  let html = esc(text);
+  for (const n of needles) {
+    const e = esc(n).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    html = html.replace(new RegExp(`(?<![\\d,.])${e}(?![\\d]|[,.]\\d)`, "g"), "<mark>$&</mark>");
+  }
+  return html;
+}
+
+async function renderDetail() {
+  const f = DATA.filings.find((x) => x.id === state.sel);
+  if (!f) return;
+  const runs = DATA.models.map((m) => m.run);
+  const head = `<tr><th>Field</th><th class="mod" style="text-align:right">Answer key</th>${
+    runs.map((r) => `<th class="mod" title="${esc(modelLabel(r))}">${esc(SHORT[r] || modelLabel(r))}</th>`).join("")}</tr>`;
+  const body = DATA.fields.map((k) => {
+    const fld = f.fields[k], g = fld.gold;
+    const gold = g
+      ? `<td class="gold" title="${full(g.value, k)}"><span class="v">${fmt(g.value, k)}</span><span class="d">${g.period_end}</span><span class="d">“${esc(g.displayed)}” ${g.scale}</span></td>`
+      : `<td class="gold"><span class="d">not scored</span></td>`;
+    const cells = runs.map((r) => {
+      const a = fld.answers[r];
+      const cls = a.category === "correct" ? "ok" : isWrong(a) ? "bad" : "";
+      const tag = isWrong(a) ? `<span class="d tag">${CAT_LABEL[a.category] || a.category}</span>` : "";
+      const date = a.period_end && (!g || a.period_end !== g.period_end || isWrong(a)) ? `<span class="d">${esc(a.period_end)}</span>` : "";
+      return `<td class="cell ${cls}" title="${full(a.value, k)}"><span class="v">${fmt(a.value, k)}</span>${date}${tag}</td>`;
+    }).join("");
+    return `<tr><td><b>${FIELD_LABEL[k]}</b></td>${gold}${cells}</tr>`;
+  }).join("");
+  $("detail").innerHTML = `
+    <h3>${esc(f.name)} (${esc(f.ticker)}), fiscal ${f.fiscal_year}</h3>
+    <div class="meta">Year ended ${f.period_end} · filed ${f.filing_date} · ${esc(f.sector)} · <a href="${f.url}" target="_blank" rel="noopener">10-K on SEC EDGAR</a></div>
+    <div class="scroll"><table class="answers"><thead>${head}</thead><tbody>${body}</tbody></table></div>
+    <details id="inp"><summary>The model input (what every model read; answer-key numbers highlighted)</summary><pre>Loading…</pre></details>`;
+  $("inp").addEventListener("toggle", async (ev) => {
+    if (!ev.target.open || ev.target.dataset.loaded) return;
+    ev.target.dataset.loaded = "1";
+    try {
+      const text = await (await fetch(`data/inputs/${encodeURIComponent(f.id)}.txt`)).text();
+      const needles = DATA.fields.map((k) => f.fields[k].gold && f.fields[k].gold.displayed).filter(Boolean);
+      ev.target.querySelector("pre").innerHTML = highlight(text, [...new Set(needles)]);
+    } catch (e) {
+      ev.target.querySelector("pre").textContent = "Couldn't load the input.";
+    }
+  });
+}
+
+function select(id) {
+  state.sel = id;
+  try { history.replaceState(null, "", "#" + encodeURIComponent(id)); } catch (e) {}
+  renderList();
+  renderDetail();
+}
+
+function refresh() { renderCats(); renderList(); }
+
+async function main() {
+  DATA = await (await fetch("data/results.json")).json();
+  $("model").innerHTML = DATA.models.map((m) => `<option value="${m.run}" ${m.run === state.model ? "selected" : ""}>${esc(m.label)}</option>`).join("");
+  $("field").innerHTML = `<option value="all">All six</option>` + DATA.fields.map((k) => `<option value="${k}">${FIELD_LABEL[k]}</option>`).join("");
+  renderResults();
+  refresh();
+  $("results").addEventListener("click", (e) => {
+    const tr = e.target.closest("tr[data-run]");
+    if (!tr) return;
+    state.model = tr.dataset.run; $("model").value = state.model;
+    renderResults(); refresh();
+  });
+  $("model").addEventListener("change", (e) => { state.model = e.target.value; renderResults(); refresh(); });
+  $("field").addEventListener("change", (e) => { state.field = e.target.value; refresh(); });
+  $("cat").addEventListener("change", (e) => { state.cat = e.target.value; renderList(); });
+  $("q").addEventListener("input", (e) => { state.q = e.target.value; renderList(); });
+  $("wrong").addEventListener("change", (e) => { state.wrong = e.target.checked; renderList(); });
+  $("list").addEventListener("click", (e) => {
+    const tr = e.target.closest("tr[data-id]");
+    if (tr) select(tr.dataset.id);
+  });
+  const fromHash = decodeURIComponent(location.hash.slice(1));
+  select(DATA.filings.some((f) => f.id === fromHash) ? fromHash : "SBUX-2024");
+}
+main();
+</script>
+</body>
+</html>

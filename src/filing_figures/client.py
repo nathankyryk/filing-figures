@@ -87,6 +87,13 @@ def _ask_rules(rec: dict) -> dict:
     return {"raw": json.dumps(rules.extract(rec["input"])), "finish_reason": "stop", "usage": {}}
 
 
+def ask(rec: dict, cfg: Config) -> dict:
+    """One filing, one request: {raw, finish_reason, usage, latency_s} (errors are raised)."""
+    t0 = time.perf_counter()
+    got = _ask_rules(rec) if cfg.endpoint == "rules" else _ask_model(_client(cfg), cfg, rec)
+    return {**got, "latency_s": round(time.perf_counter() - t0, 3)}
+
+
 PROVIDER_TRIES = 3
 
 

@@ -47,8 +47,10 @@ def choose_companies(sp500: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
     return df.iloc[picked].reset_index(drop=True)
 
 
-def list_10ks(submissions: dict, companyfacts: dict) -> list[dict]:
-    """The company's original inline-XBRL 10-Ks for fiscal years 2019-2024, one per year."""
+def list_10ks(
+    submissions: dict, companyfacts: dict, first_year: int = FIRST_YEAR, last_year: int = LAST_YEAR
+) -> list[dict]:
+    """The company's original inline-XBRL 10-Ks for fiscal years 2019-2024 (by default), one per year."""
     rec = submissions["filings"]["recent"]
     fy_of = fiscal_years(companyfacts)
     by_year: dict[int, dict] = {}
@@ -57,7 +59,7 @@ def list_10ks(submissions: dict, companyfacts: dict) -> list[dict]:
             continue
         accession = rec["accessionNumber"][i]
         fy = fy_of.get(accession)
-        if fy is None or not FIRST_YEAR <= fy <= LAST_YEAR:
+        if fy is None or not first_year <= fy <= last_year:
             continue
         filing = {
             "accession": accession,

@@ -434,6 +434,51 @@ def stub(
         pass
 
 
+@app.command()
+def extract(
+    ticker: str = typer.Option(..., help="Company ticker, e.g. SBUX"),
+    year: int = typer.Option(..., help="The 10-K's fiscal year (the company's own)"),
+    endpoint: str = typer.Option("vllm", help="openrouter, vllm, rules, or a base URL"),
+    model: str = typer.Option("", help="Model name at the endpoint"),
+    reasoning: str = typer.Option("off", help="off, or an effort level: low, medium, high"),
+    schema: bool = typer.Option(False, "--schema/--no-schema", help="Constrained decoding with the JSON schema"),
+    max_tokens: int = typer.Option(2048, help="Output token cap"),
+    as_json: bool = typer.Option(False, "--json", help="Print only the model's answer"),
+) -> None:
+    """Fetch one 10-K from EDGAR, ask a model for the six figures, and score them against XBRL."""
+    from filing_figures.client import Config, ask
+    from filing_figures.extract import compare, load_filing, table
+
+    rec = load_filing(_edgar(), ticker, year)
+    cfg = Config(
+        endpoint=endpoint,
+        model=model,
+        max_tokens=max_tokens,
+        schema=schema,
+        reasoning=None if endpoint == "rules" else reasoning,
+    )
+    got = ask(rec, cfg)
+    if as_json:
+        typer.echo(got["raw"])
+        return
+    typer.echo(
+        f"{rec['ticker']} FY{rec['fiscal_year']} 10-K (accession {rec['accession']}, filed {rec['filing_date']}): "
+        f"{len(rec['input']):,} characters of statements"
+    )
+    typer.echo(f"{model or endpoint}: answered in {got['latency_s']:.1f} s\n")
+    typer.echo(table(compare(rec, got["raw"])))
+
+
+@app.command()
+def space(out: Path = typer.Option(Path("space") / "data", help="The viewer's data folder")) -> None:
+    """Build the results viewer's data (space/) from the saved test predictions and scores."""
+    from filing_figures.space import build
+
+    sp500 = pd.read_csv(DATA / "universe" / "sp500.csv")
+    names = dict(zip(sp500["ticker"], sp500["name"], strict=True))
+    typer.echo(build(_records("test"), OUT, out, names))
+
+
 # --- GPU pod commands (scripts/run_gpu_jobs.sh runs these; each names the environment it needs) ---
 
 

@@ -190,5 +190,9 @@ def merge(adapter_dir: Path, out_dir: Path) -> dict:
     """A checkpoint merged into its base model's weights (see merge.py), ready for vLLM."""
     from filing_figures.merge import merge_adapter
 
-    meta = json.loads((adapter_dir.parent / "train_meta.json").read_text(encoding="utf-8"))
-    return merge_adapter(meta["config"]["base"], adapter_dir, out_dir)
+    meta_path = adapter_dir.parent / "train_meta.json"
+    if meta_path.exists():  # a checkpoint of a local `train` run
+        base = json.loads(meta_path.read_text(encoding="utf-8"))["config"]["base"]
+    else:  # e.g. the adapter downloaded from Hugging Face
+        base = json.loads((adapter_dir / "adapter_config.json").read_text(encoding="utf-8"))["base_model_name_or_path"]
+    return merge_adapter(base, adapter_dir, out_dir)

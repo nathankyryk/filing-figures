@@ -106,6 +106,8 @@ def test_tolerances():
     ("field", "part", "expected"),
     [
         ("revenue", {"value": 391_035}, "scale"),
+        ("revenue", {"value": 3_910_350e6}, "off_by_10x"),
+        ("net_income", {"value": 9_373.6e6}, "off_by_10x"),
         ("revenue", {"value": -391_035e6}, "sign"),
         ("revenue", {"value": 383_285e6, "period_end": PRIOR_END}, "wrong_period"),
         ("total_assets", {"value": 352_583e6}, "wrong_period"),

@@ -7,9 +7,10 @@ reported as separate columns. Only fields with a gold value are scored.
 
 Each wrong field gets the first category that fits, in this order:
   no_response (the request failed), invalid_json, missing (no value), date (right value, wrong
-  period end), scale (off by 10^3, 10^6 or 10^9), sign, wrong_period (the same concept's value
-  for another period, filed in the same 10-K), wrong_line_item (any other fact filed in the 10-K,
-  e.g. basic EPS or net income including noncontrolling interests), other.
+  period end), scale (off by 10^3, 10^6 or 10^9), off_by_10x (off by another power of ten: an
+  extra or missing zero when writing out the number, e.g. 10x or 100x), sign, wrong_period (the
+  same concept's value for another period, filed in the same 10-K), wrong_line_item (any other
+  fact filed in the 10-K, e.g. basic EPS or net income including noncontrolling interests), other.
 
 CIs come from a bootstrap over companies, not filings: one company's six 10-Ks share a format,
 so they are not independent. `compare` is the paired version for the gap between two runs.
@@ -31,6 +32,7 @@ from filing_figures.schema import Answer
 REL_TOL = 0.005
 EPS_ABS_TOL = 0.005
 SCALE_FACTORS = (1e3, 1e6, 1e9, 1e-3, 1e-6, 1e-9)
+DIGIT_FACTORS = (1e1, 1e2, 1e4, 1e5, 1e-1, 1e-2, 1e-4, 1e-5)
 CATEGORIES = (
     "correct",
     "no_response",
@@ -38,6 +40,7 @@ CATEGORIES = (
     "missing",
     "date",
     "scale",
+    "off_by_10x",
     "sign",
     "wrong_period",
     "wrong_line_item",
@@ -128,6 +131,8 @@ def categorize(pred: dict | None, gold: dict, facts: list[dict], field: str) -> 
         return "correct" if pred["period_end"] == gold["period_end"] else "date"
     if g != 0 and any(close(v, g * f, field) for f in SCALE_FACTORS):
         return "scale"
+    if g != 0 and any(close(v, g * f, field) for f in DIGIT_FACTORS):
+        return "off_by_10x"
     if g != 0 and close(v, -g, field):
         return "sign"
     matches = [f for f in facts if close(v, f["val"], field) and not close(f["val"], g, field)]
