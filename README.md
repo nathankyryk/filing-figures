@@ -10,6 +10,10 @@ Every answer is checked against the XBRL data each company filed with the SEC, s
 
 **Links:** [browse every answer](https://huggingface.co/spaces/kyryk/filing-figures) · [model](https://huggingface.co/kyryk/filing-figures-qwen3.5-4b-nvfp4) · [LoRA adapter](https://huggingface.co/kyryk/filing-figures-qwen3.5-4b-lora) · [dataset](https://huggingface.co/datasets/kyryk/filing-figures)
 
+![figures extract reading NVIDIA's FY2026 10-K: all six figures match XBRL](docs/demo.gif)
+
+*A real run: the fine-tuned model reads NVIDIA's FY2026 10-K, a company and a year it never saw, and gets all six figures right in 3.7 s. Here it runs as an 8-bit GGUF with llama.cpp on an AMD Radeon RX 9070 XT.*
+
 ## Results
 
 Test set: 207 filings from 36 companies, none of them seen during training or tuning. 1,186 figures scored. The test set was run once, at the end.
@@ -154,7 +158,7 @@ vllm serve kyryk/filing-figures-qwen3.5-4b-nvfp4 --served-model-name filing-figu
 uv run figures extract --ticker SBUX --year 2025 --endpoint http://localhost:8000/v1 --model filing-figures
 ```
 
-Any OpenAI-compatible endpoint works. Here it runs on Starbucks' FY2025 10-K, filed after the dataset was built, with Qwen3.5-9B through OpenRouter:
+Any OpenAI-compatible endpoint works. The demo at the top merges the LoRA adapter into Qwen3.5-4B (`merge.py`), converts it to an 8-bit GGUF with llama.cpp's `convert_hf_to_gguf.py`, and serves it with `llama-server --reasoning off` on an AMD GPU. Here it runs on Starbucks' FY2025 10-K, filed after the dataset was built, with Qwen3.5-9B through OpenRouter:
 
 ```
 $ uv run figures extract --ticker SBUX --year 2025 --endpoint openrouter --model qwen/qwen3.5-9b

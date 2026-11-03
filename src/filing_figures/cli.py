@@ -457,14 +457,15 @@ def extract(
         schema=schema,
         reasoning=None if endpoint == "rules" else reasoning,
     )
+    if not as_json:  # show the filing before the model call, so the wait has context
+        typer.echo(
+            f"{rec['ticker']} FY{rec['fiscal_year']} 10-K (accession {rec['accession']}, filed {rec['filing_date']}): "
+            f"{len(rec['input']):,} characters of statements"
+        )
     got = ask(rec, cfg)
     if as_json:
         typer.echo(got["raw"])
         return
-    typer.echo(
-        f"{rec['ticker']} FY{rec['fiscal_year']} 10-K (accession {rec['accession']}, filed {rec['filing_date']}): "
-        f"{len(rec['input']):,} characters of statements"
-    )
     typer.echo(f"{model or endpoint}: answered in {got['latency_s']:.1f} s\n")
     typer.echo(table(compare(rec, got["raw"])))
 
