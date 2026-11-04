@@ -64,11 +64,12 @@ def _client(cfg: Config):
 
 
 def _ask_model(client, cfg: Config, rec: dict) -> dict:
-    kwargs = {"model": cfg.model, "messages": prompts.messages(rec["input"]), "max_tokens": cfg.max_tokens}
+    task = rec.get("task", "v1")
+    kwargs = {"model": cfg.model, "messages": prompts.messages(rec["input"], task), "max_tokens": cfg.max_tokens}
     if cfg.temperature is not None:
         kwargs["temperature"] = cfg.temperature
     if cfg.schema:
-        kwargs["response_format"] = response_format()
+        kwargs["response_format"] = response_format(task)
     extras = cfg.request_extras()
     if extras:
         kwargs["extra_body"] = extras
@@ -143,7 +144,7 @@ def predict(records: list[dict], cfg: Config, out_path: Path, on_result=None) ->
             "latency_s": round(time.perf_counter() - t0, 3),
             "model": cfg.model or cfg.endpoint,
             "endpoint": cfg.endpoint,
-            "prompt_version": prompts.PROMPT_VERSION,
+            "prompt_version": prompts.prompt_version(rec.get("task", "v1")),
             "schema": cfg.schema,
             "reasoning": cfg.reasoning,
             "ts": datetime.now(UTC).isoformat(timespec="seconds"),

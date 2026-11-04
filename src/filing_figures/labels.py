@@ -11,6 +11,15 @@ Each field tries its XBRL tags in order and the first tag with a match wins (rev
 
 Verified on Apple's FY2024 10-K (accession 0000320193-24-000123, 2026-10-28): its three revenue
 values all carry fy=2024; only the one ending 2024-09-28 (363 days) is the FY2024 figure.
+
+Two task versions (`TASKS`). v1 is the six fields above, unchanged, so its published results stay
+reproducible. v2 adds six harder ones, each with a trap: capex (printed in parentheses, answered as
+the positive cash paid), cash and equivalents (not the total with restricted cash), stockholders'
+equity (not the total with noncontrolling interests), basic EPS (next to diluted), last year's
+revenue (`prior_year`: the year before, as THIS filing shows it, restated or not) and free cash flow
+(`derived`: operating cash flow minus capex; dataset.py computes it from the two scored parts).
+Tag lists were chosen on train filings only (2026-11-03): of 967, capex 902 have one of its tags,
+cash 967, equity 964, basic EPS 938, prior-year revenue 949.
 """
 
 from __future__ import annotations
@@ -27,24 +36,24 @@ MAX_COVER_DAYS = 200  # the cover's shares date falls between the year end and t
 class Field:
     name: str
     unit: str
-    kind: str  # "year": a year-long period; "instant": at the period end; "cover": the cover-page date
+    # "year": a year-long period; "instant": at the period end; "cover": the cover-page date;
+    # "prior_year": the year-long period before the current one; "derived": computed from `parts`
+    kind: str
     tags: tuple[str, ...]  # "taxonomy:Concept", tried in order
+    parts: tuple[str, ...] = ()  # derived: (minuend, subtrahend) field names
 
+
+REVENUE_TAGS = (
+    "us-gaap:Revenues",
+    "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
+    "us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax",
+    "us-gaap:SalesRevenueNet",
+    "us-gaap:SalesRevenueGoodsNet",
+    "us-gaap:SalesRevenueServicesNet",
+)
 
 FIELDS: tuple[Field, ...] = (
-    Field(
-        "revenue",
-        "USD",
-        "year",
-        (
-            "us-gaap:Revenues",
-            "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
-            "us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax",
-            "us-gaap:SalesRevenueNet",
-            "us-gaap:SalesRevenueGoodsNet",
-            "us-gaap:SalesRevenueServicesNet",
-        ),
-    ),
+    Field("revenue", "USD", "year", REVENUE_TAGS),
     # Net income attributable to the company. Some filers (e.g. American Tower) tag that line only
     # as "available to common stockholders"; ProfitLoss (including noncontrolling interests) is last.
     Field(
@@ -73,6 +82,68 @@ FIELDS: tuple[Field, ...] = (
 )
 FIELD_NAMES = tuple(f.name for f in FIELDS)
 
+_V1 = {f.name: f for f in FIELDS}
+CAPEX = Field(
+    "capex",
+    "USD",
+    "year",
+    (
+        "us-gaap:PaymentsToAcquirePropertyPlantAndEquipment",
+        "us-gaap:PaymentsToAcquireProductiveAssets",
+        "us-gaap:PaymentsForCapitalImprovements",
+        "us-gaap:PaymentsToAcquireOtherPropertyPlantAndEquipment",
+    ),
+)
+# v2 asks for the fields statement by statement, in reading order; free cash flow comes after its parts.
+FIELDS_V2: tuple[Field, ...] = (
+    _V1["revenue"],
+    Field("revenue_prior", "USD", "prior_year", REVENUE_TAGS),
+    _V1["net_income"],
+    Field(
+        "eps_basic", "USD/shares", "year", ("us-gaap:EarningsPerShareBasic", "us-gaap:EarningsPerShareBasicAndDiluted")
+    ),
+    _V1["eps_diluted"],
+    _V1["total_assets"],
+    # The combined tag is a fallback for filers with no restricted cash, who tag the balance-sheet line with it.
+    # The coverage check (dataset.py) keeps it only when the balance sheet shows that number.
+    Field(
+        "cash",
+        "USD",
+        "instant",
+        (
+            "us-gaap:CashAndCashEquivalentsAtCarryingValue",
+            "us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+        ),
+    ),
+    Field(
+        "equity",
+        "USD",
+        "instant",
+        (
+            "us-gaap:StockholdersEquity",
+            "us-gaap:StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+        ),
+    ),
+    _V1["shares_outstanding"],
+    _V1["operating_cash_flow"],
+    CAPEX,
+    Field("fcf", "USD", "derived", (), parts=("operating_cash_flow", "capex")),
+)
+TASKS: dict[str, tuple[Field, ...]] = {"v1": FIELDS, "v2": FIELDS_V2}
+FIELD_BY_NAME = {f.name: f for f in FIELDS_V2}
+PER_SHARE = frozenset(f.name for f in FIELDS_V2 if f.unit == "USD/shares")
+
+
+def task_fields(task: str = "v1") -> tuple[Field, ...]:
+    if task not in TASKS:
+        raise ValueError(f"unknown task {task!r}; known: {', '.join(TASKS)}")
+    return TASKS[task]
+
+
+def field_names(task: str = "v1") -> tuple[str, ...]:
+    return tuple(f.name for f in task_fields(task))
+
+
 # Look-alike facts kept with each filing (every period), so the scorer can name an error:
 # a prediction equal to one of these is a "wrong line item", one equal to a prior-year
 # value of the right tag is a "wrong period".
@@ -94,6 +165,18 @@ LOOKALIKES: tuple[str, ...] = (
     "us-gaap:NetCashProvidedByUsedInFinancingActivities",
     "dei:EntityPublicFloat",
 )
+# v2's look-alikes: v1's, plus near misses for the new fields. Kept separate so v1 records don't change.
+LOOKALIKES_V2: tuple[str, ...] = LOOKALIKES + (
+    "us-gaap:PaymentsToAcquireBusinessesNetOfCashAcquired",
+    "us-gaap:PaymentsToAcquireIntangibleAssets",
+    "us-gaap:PaymentsToDevelopSoftware",
+    "us-gaap:PaymentsToAcquireRealEstate",
+    "us-gaap:RestrictedCashAndCashEquivalentsAtCarryingValue",
+    "us-gaap:CashAndCashEquivalentsPeriodIncreaseDecrease",
+    "us-gaap:MinorityInterest",
+    "us-gaap:LiabilitiesAndStockholdersEquity",
+)
+TASK_LOOKALIKES = {"v1": LOOKALIKES, "v2": LOOKALIKES_V2}
 
 
 def _days(start: str | None, end: str) -> int | None:
@@ -156,6 +239,11 @@ def _matches(field: Field, f: dict, period_end: str) -> bool:
     if field.kind == "year":
         days = _days(f["start"], f["end"])
         return f["end"] == period_end and days is not None and MIN_YEAR_DAYS <= days <= MAX_YEAR_DAYS
+    if field.kind == "prior_year":
+        # A year-long period ending a year (350-380 days) before the current one: only last year fits
+        days = _days(f["start"], f["end"])
+        gap = (date.fromisoformat(period_end) - date.fromisoformat(f["end"])).days
+        return days is not None and MIN_YEAR_DAYS <= days <= MAX_YEAR_DAYS and MIN_YEAR_DAYS <= gap <= MAX_YEAR_DAYS
     # cover: an instant on or after the year end, before the filing could have been made
     lag = (date.fromisoformat(f["end"]) - date.fromisoformat(period_end)).days
     return f["start"] is None and 0 <= lag <= MAX_COVER_DAYS
@@ -197,17 +285,37 @@ def label_field(field: Field, facts: list[dict], period_end: str) -> tuple[dict 
     return chosen, flags
 
 
-def label_filing(companyfacts: dict, accession: str, report_date: str | None) -> dict:
+def derive(field: Field, labels: dict) -> tuple[dict | None, list[str]]:
+    """A derived field's value from its parts' labels (minuend - subtrahend), dated like the first part."""
+    a, b = (labels.get(p) for p in field.parts)
+    if a is None or b is None:
+        return None, ["part_missing"]
+    return {
+        "value": a["value"] - b["value"],
+        "start": a["start"],
+        "end": a["end"],
+        "tag": "derived",
+        "alternatives": [],
+    }, []
+
+
+def label_filing(companyfacts: dict, accession: str, report_date: str | None, task: str = "v1") -> dict:
     """Gold labels for one 10-K, plus the look-alike facts the scorer uses to name errors."""
-    gold_tags = tuple(t for f in FIELDS for t in f.tags)
+    fields = task_fields(task)
+    # The period end is found from v1's tags in every task, so adding fields can't move it
+    period_tags = tuple(t for f in FIELDS for t in f.tags)
+    gold_tags = tuple(dict.fromkeys(t for f in fields for t in (*period_tags, *f.tags)))
     facts = accession_facts(companyfacts, accession, gold_tags)
-    period_end, period_flags = current_period_end(facts, report_date)
+    period_end, period_flags = current_period_end([f for f in facts if f["tag"] in period_tags], report_date)
     labels, flags = {}, {}
-    for field in FIELDS:
+    for field in fields:
         if period_end is None:
             labels[field.name], flags[field.name] = None, ["missing"]
-            continue
-        labels[field.name], flags[field.name] = label_field(field, facts, period_end)
+        elif field.kind == "derived":
+            labels[field.name], flags[field.name] = derive(field, labels)
+        else:
+            labels[field.name], flags[field.name] = label_field(field, facts, period_end)
+    lookalikes = tuple(t for t in TASK_LOOKALIKES[task] if t not in gold_tags)
     return {
         "accession": accession,
         "period_end": period_end,
@@ -215,5 +323,5 @@ def label_filing(companyfacts: dict, accession: str, report_date: str | None) ->
         "labels": labels,
         "flags": flags,
         "period_flags": period_flags,
-        "context_facts": facts + accession_facts(companyfacts, accession, LOOKALIKES),
+        "context_facts": facts + accession_facts(companyfacts, accession, lookalikes),
     }

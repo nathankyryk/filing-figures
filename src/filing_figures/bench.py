@@ -67,7 +67,7 @@ async def _one(client, model: str, rec: dict, sem: asyncio.Semaphore, max_tokens
         try:
             stream = await client.chat.completions.create(
                 model=model,
-                messages=prompts.messages(rec["input"]),
+                messages=prompts.messages(rec["input"], rec.get("task", "v1")),
                 max_tokens=max_tokens,
                 temperature=0.0,
                 stream=True,

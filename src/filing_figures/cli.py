@@ -15,6 +15,8 @@ DATA = Path("data")
 
 OUT = Path(os.environ.get("FIGURES_OUT", "outputs"))  # the pod's check stage writes to outputs/check
 HANDCHECK = Path("labels") / "handcheck.csv"
+# v2 reuses v1's checks (same filings, same six fields) and adds its own for the new fields
+HANDCHECKS = {"v1": [HANDCHECK], "v2": [HANDCHECK, Path("labels") / "handcheck_v2.csv"]}
 HF_DATASET = "kyryk/filing-figures"
 
 
@@ -120,7 +122,12 @@ def download(
         typer.echo(f"  FAILED {accession}: {err}")
 
 
-def _build_one(row: dict) -> dict:
+def _task_dir(task: str, root: Path) -> Path:
+    """v1 keeps its original paths (data/build, data/export); later tasks get a subfolder."""
+    return root if task == "v1" else root / task
+
+
+def _build_one(row: dict, task: str = "v1") -> dict:
     """One record, from the cache only (run `download` first). Top-level so processes can run it."""
     import gzip
     import json
@@ -133,7 +140,7 @@ def _build_one(row: dict) -> dict:
     try:
         cf = json.loads(gzip.decompress((raw / "companyfacts" / f"{cik10(row['cik'])}.json.gz").read_bytes()))
         html = gzip.decompress((raw / "docs" / str(row["cik"]) / folder / f"{row['primary_document']}.gz").read_bytes())
-        return build_record(row, cf, html)
+        return build_record(row, cf, html, task)
     except Exception as e:  # noqa: BLE001 - one bad filing must not stop the build
         return {"id": f"{row['ticker']}-{row['fiscal_year']}", "accession": row["accession"], "error": repr(e)}
 
@@ -144,15 +151,19 @@ def build(
     split: str = typer.Option(None, help="Only these splits, e.g. train or train,valid"),
     tickers: str = typer.Option(None, help="Comma-separated tickers"),
     workers: int = typer.Option(4, help="Processes"),
-    out: Path = typer.Option(DATA / "build" / "records.jsonl", help="Output JSONL"),
+    task: str = typer.Option("v1", help="Task version: v1 (6 fields) or v2 (12)"),
+    out: Path = typer.Option(None, help="Output JSONL [default: data/build[/<task>]/records.jsonl]"),
 ) -> None:
     """Labels + model input + coverage for every cached filing, then a coverage summary."""
     import json
     from collections import Counter
     from concurrent.futures import ProcessPoolExecutor
+    from functools import partial
 
-    from filing_figures.labels import FIELD_NAMES
+    from filing_figures.labels import FIELD_BY_NAME, field_names
 
+    names = field_names(task)
+    out = out or _task_dir(task, DATA / "build") / "records.jsonl"
     rows = _filings(limit, tickers, split).to_dict("records")
     out.parent.mkdir(parents=True, exist_ok=True)
     errors, flag_counts = [], Counter()
@@ -160,7 +171,9 @@ def build(
     with (
         ProcessPoolExecutor(workers) as pool,
         out.open("w", encoding="utf-8") as f,
-        typer.progressbar(pool.map(_build_one, rows, chunksize=4), length=len(rows), label="filings") as bar,
+        typer.progressbar(
+            pool.map(partial(_build_one, task=task), rows, chunksize=4), length=len(rows), label="filings"
+        ) as bar,
     ):
         for rec in bar:
             f.write(json.dumps(rec) + "\n")
@@ -170,22 +183,29 @@ def build(
             s = rec.get("split") or "-"
             total[s] += 1
             usable[s] += rec["usable"]
-            for name in FIELD_NAMES:
+
+            def is_labelled(name: str, rec: dict = rec) -> bool:
+                if FIELD_BY_NAME[name].kind == "derived":  # labelled when all its parts are
+                    return all(is_labelled(p) for p in FIELD_BY_NAME[name].parts)
+                return rec["gold"][name] is not None or "not_in_input" in rec["flags"][name]
+
+            for name in names:
                 flag_counts.update(f"{name}:{x}" for x in rec["flags"][name])
-                labelled[s, name] += rec["gold"][name] is not None or "not_in_input" in rec["flags"][name]
+                labelled[s, name] += is_labelled(name)
                 in_input[s, name] += rec["gold"][name] is not None
     typer.echo(f"\n{len(rows)} filings, {len(errors)} errors -> {out}")
     typer.echo("Field coverage: labelled values that are inside the model input")
-    splits = sorted(total, key=lambda s: ("train", "valid", "test").index(s) if s in ("train", "valid", "test") else 9)
-    typer.echo(f"  {'':20s}" + "".join(f"{s:>16s}" for s in splits))
-    for name in [*FIELD_NAMES, "ALL"]:
+    order = ("train", "valid", "test", "ood-valid", "ood-test")
+    splits = sorted(total, key=lambda s: order.index(s) if s in order else 9)
+    typer.echo(f"  {'':20s}" + "".join(f"{s:>18s}" for s in splits))
+    for name in [*names, "ALL"]:
         cells = []
         for s in splits:
-            n_in = sum(in_input[s, f] for f in FIELD_NAMES) if name == "ALL" else in_input[s, name]
-            n_lab = sum(labelled[s, f] for f in FIELD_NAMES) if name == "ALL" else labelled[s, name]
-            cells.append(f"{n_in:>6d}/{n_lab:<5d}{100 * n_in / max(n_lab, 1):4.1f}%")
-        typer.echo(f"  {name:20s}" + "".join(f"{c:>16s}" for c in cells))
-    typer.echo(f"  {'usable filings':20s}" + "".join(f"{f'{usable[s]}/{total[s]}':>16s}" for s in splits))
+            n_in = sum(in_input[s, f] for f in names) if name == "ALL" else in_input[s, name]
+            n_lab = sum(labelled[s, f] for f in names) if name == "ALL" else labelled[s, name]
+            cells.append(f"{n_in:>6d}/{n_lab:<6d}{100 * n_in / max(n_lab, 1):5.1f}%")
+        typer.echo(f"  {name:20s}" + "".join(f"{c:>18s}" for c in cells))
+    typer.echo(f"  {'usable filings':20s}" + "".join(f"{f'{usable[s]}/{total[s]}':>18s}" for s in splits))
     typer.echo("flags: " + ", ".join(f"{k}={v}" for k, v in sorted(flag_counts.items())))
     for e in errors[:10]:
         typer.echo(f"  ERROR {e['id']}: {e['error']}")
@@ -193,15 +213,18 @@ def build(
 
 @app.command()
 def export(
-    records: Path = typer.Option(DATA / "build" / "records.jsonl", help="Output of `build`"),
-    out: Path = typer.Option(DATA / "export", help="Folder for train/valid/test.jsonl"),
+    task: str = typer.Option("v1", help="Task version: v1 or v2"),
+    records: Path = typer.Option(None, help="Output of `build` [default: data/build[/<task>]/records.jsonl]"),
+    out: Path = typer.Option(None, help="Folder for <split>.jsonl [default: data/export[/<task>]]"),
 ) -> None:
-    """Write the usable records of each split, with the hand-check (labels/handcheck.csv) applied."""
+    """Write the usable records of each split, with the hand-check (labels/handcheck*.csv) applied."""
     from filing_figures.dataset import export_splits
 
-    for split, c in export_splits(records, out, HANDCHECK).items():
+    records = records or _task_dir(task, DATA / "build") / "records.jsonl"
+    out = out or _task_dir(task, DATA / "export")
+    for split, c in export_splits(records, out, HANDCHECKS[task]).items():
         typer.echo(
-            f"{split:6s} {c['exported']:4d} of {c['filings']:4d} filings exported ({c['not_usable']} not usable), "
+            f"{split:9s} {c['exported']:4d} of {c['filings']:4d} filings exported ({c['not_usable']} not usable), "
             f"{c['scored_fields']} scored fields, {c['handchecked_fields']} hand-checked"
         )
 

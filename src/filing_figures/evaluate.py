@@ -1,9 +1,10 @@
 """Scoring against the XBRL answer key: field accuracy, error categories and 95% CIs.
 
 A field is correct when its value is within 0.5% of the gold value AND its period end is exactly
-the gold one. Diluted EPS is reported to the cent, so it must match to the cent (within $0.005):
-0.5% of a $6.08 EPS would also accept $6.11, the basic EPS, a wrong line item. Scale and fiscal year are
-reported as separate columns. Only fields with a gold value are scored.
+the gold one. EPS (diluted, and basic in task v2) is reported to the cent, so it must match to the cent
+(within $0.005): 0.5% of a $6.08 EPS would also accept $6.11, the basic EPS, a wrong line item. Scale and
+fiscal year are reported as separate columns. Only fields with a gold value are scored: each record's own
+`gold` keys, so one scorer serves both tasks.
 
 Each wrong field gets the first category that fits, in this order:
   no_response (the request failed), invalid_json, missing (no value), date (right value, wrong
@@ -26,8 +27,8 @@ from pathlib import Path
 import numpy as np
 from pydantic import ValidationError
 
-from filing_figures.labels import FIELD_NAMES, FIELDS
-from filing_figures.schema import Answer
+from filing_figures.labels import FIELDS_V2, PER_SHARE
+from filing_figures.schema import answer_model
 
 REL_TOL = 0.005
 EPS_ABS_TOL = 0.005
@@ -46,15 +47,15 @@ CATEGORIES = (
     "wrong_line_item",
     "other",
 )
-TAGS = {f.name: f.tags for f in FIELDS}
+TAGS = {f.name: f.tags for f in FIELDS_V2}  # v2's fields include v1's, with the same tags
 N_BOOT = 2000
 
 _THINK = re.compile(r"<think>.*?</think>", re.DOTALL)
 _FENCE = re.compile(r"```(?:json)?")
 
 
-def parse_answer(raw: str | None) -> tuple[dict | None, bool]:
-    """(the JSON object, whether it matches the schema exactly).
+def parse_answer(raw: str | None, task: str = "v1") -> tuple[dict | None, bool]:
+    """(the JSON object, whether it matches the task's schema exactly).
 
     Lenient about wrapping: drops <think> blocks and code fences and reads the outermost {...}.
     An unfinished <think> block (the model ran out of tokens) is no answer at all."""
@@ -74,7 +75,7 @@ def parse_answer(raw: str | None) -> tuple[dict | None, bool]:
     if not isinstance(obj, dict):
         return None, False
     try:
-        Answer.model_validate(obj)
+        answer_model(task).model_validate(obj)
     except ValidationError:
         return obj, False
     return obj, True
@@ -118,7 +119,7 @@ def field_prediction(obj: dict, name: str) -> dict | None:
 
 
 def close(pred: float, gold: float, field: str) -> bool:
-    tol = EPS_ABS_TOL if field == "eps_diluted" else abs(gold) * REL_TOL
+    tol = EPS_ABS_TOL if field in PER_SHARE else abs(gold) * REL_TOL
     return abs(pred - gold) <= tol + 1e-9
 
 
@@ -160,9 +161,8 @@ def score(records: list[dict], predictions: dict[str, dict]) -> list[dict]:
     for rec in records:
         p = predictions.get(rec["id"])
         failed = p is None or bool(p.get("error"))
-        obj, valid = (None, False) if failed else parse_answer(p.get("raw"))
-        for name in FIELD_NAMES:
-            gold = rec["gold"][name]
+        obj, valid = (None, False) if failed else parse_answer(p.get("raw"), rec.get("task", "v1"))
+        for name, gold in rec["gold"].items():
             if gold is None:
                 continue
             pred = None
@@ -233,7 +233,8 @@ def summarize(rows: list[dict], n_boot: int = N_BOOT, seed: int = 0) -> dict:
         "n_fields": len(rows),
         "overall": boot.metric((r["cik"], r["correct"]) for r in rows),
         "fields": {
-            name: boot.metric((r["cik"], r["correct"]) for r in rows if r["field"] == name) for name in FIELD_NAMES
+            name: boot.metric((r["cik"], r["correct"]) for r in rows if r["field"] == name)
+            for name in dict.fromkeys(r["field"] for r in rows)
         },
         "all_right": boot.metric((fr[0]["cik"], all(r["correct"] for r in fr)) for fr in filings.values()),
         "valid_json": boot.metric((fr[0]["cik"], fr[0]["valid_json"]) for fr in filings.values()),

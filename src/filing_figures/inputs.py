@@ -88,6 +88,23 @@ BLOCK_TAGS = {"p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "center", "f
 TITLE_BLOCKS, TITLE_CHARS = 6, 800
 COVER_CHARS = 8000
 
+# A statement printed across two pages is two tables, with a page break between them (a footnote, the
+# page number, a repeated title). Task v2 joins them: when the selected table lacks the statement's
+# second half (no liabilities on a balance sheet that stops at total assets; no investing activities;
+# no per-share lines), the next table is kept too if it has that half. v1's inputs stay one table each.
+SECOND_HALF = {
+    "income_statement": re.compile(r"per\s+(common\s+)?share|diluted", I),
+    "balance_sheet": re.compile(r"liabilities", I),
+    "cash_flow_statement": re.compile(r"investing\s+activities", I),
+}
+CONTINUATION_GAP = 8  # small blocks allowed between the two halves
+PAGE_BREAK_LINE = 400  # longest text line in a page break ("The accompanying notes are an integral part...")
+OTHER_STATEMENT = re.compile(
+    r"statements?\s+of\s+(consolidated\s+)?(changes\s+in\s+)?\w*\W?\s*(equity|deficit|capital)"
+    r"|comprehensive\s+(income|loss)",
+    I,
+)
+
 # The section each field is read from, for the coverage check
 FIELD_SECTION = {
     "revenue": "income_statement",
@@ -96,6 +113,12 @@ FIELD_SECTION = {
     "total_assets": "balance_sheet",
     "operating_cash_flow": "cash_flow_statement",
     "shares_outstanding": "cover",
+    # task v2 (free cash flow is derived: it is covered when both its parts are)
+    "revenue_prior": "income_statement",
+    "eps_basic": "income_statement",
+    "cash": "balance_sheet",
+    "equity": "balance_sheet",
+    "capex": "cash_flow_statement",
 }
 
 
@@ -270,6 +293,29 @@ class Selection:
     cover: list[Block] = field(default_factory=list)
     statements: dict[str, tuple[list[Block], Block]] = field(default_factory=dict)  # name -> (caption, table)
     how: dict[str, str] = field(default_factory=dict)  # name -> "title" | "structure"
+    continued: dict[str, Block] = field(default_factory=dict)  # name -> the statement's second table (v2)
+
+
+def _starts_other_statement(text: str, name: str) -> bool:
+    return any(is_title(text, t) for n, t in TITLES.items() if n != name) or bool(OTHER_STATEMENT.search(text))
+
+
+def _second_half(bs: list[Block], i: int, name: str) -> int | None:
+    """The table that continues statement table i on the next page, if table i is only its first half."""
+    half = SECOND_HALF[name]
+    if any(half.search(" ".join(r)) for r in table_rows(bs[i].el)):
+        return None
+    for j in range(i + 1, min(len(bs), i + 2 + CONTINUATION_GAP)):
+        b = bs[j]
+        if b.small:
+            # A page break holds short lines; a paragraph means the statement has ended
+            if _starts_other_statement(b.text, name) or (b.kind == "text" and len(b.text) > PAGE_BREAK_LINE):
+                return None
+            continue
+        if b.kind != "table" or any(_starts_other_statement(" ".join(r), name) for r in table_rows(b.el)[:3]):
+            return None
+        return j if any(half.search(lab) for lab in _row_labels(b.el)) else None
+    return None
 
 
 MONTHS = "January|February|March|April|May|June|July|August|September|October|November|December"
@@ -337,7 +383,7 @@ def _cover(bs: list[Block]) -> list[Block]:
     return out
 
 
-def select(bs: list[Block]) -> Selection:
+def select(bs: list[Block], join_halves: bool = False) -> Selection:
     sel = Selection(cover=_cover(bs))
     titled: dict[str, list[tuple[int, list[int]]]] = {name: [] for name in TITLES}
     for i, b in enumerate(bs):
@@ -373,6 +419,12 @@ def select(bs: list[Block]) -> Selection:
                 caption = [bs[j] for j in _above(bs, i) if SCALE_NOTE.search(bs[j].text)]
                 sel.statements[name], sel.how[name] = (caption, b), "structure"
                 break
+    if join_halves:
+        index = {id(b): k for k, b in enumerate(bs)}
+        for name, (_, table) in sel.statements.items():
+            j = _second_half(bs, index[id(table)], name)
+            if j is not None:
+                sel.continued[name] = bs[j]
     return sel
 
 
@@ -391,6 +443,8 @@ def render(sel: Selection) -> str:
             "\n".join(_block_text(b) for b in caption),
             table_text(table.el),
         ]
+        if name in sel.continued:
+            parts.append(table_text(sel.continued[name].el))
     return "\n\n".join(p for p in parts if p)
 
 
@@ -403,12 +457,13 @@ class Built:
     dei: dict  # the cover's document facts, also often hidden
 
 
-def build(html: bytes) -> Built:
-    """The model input for one 10-K, and what is needed to check it."""
+def build(html: bytes, join_halves: bool = False) -> Built:
+    """The model input for one 10-K, and what is needed to check it. `join_halves` (task v2): a
+    statement split across two pages keeps both tables."""
     root = ixbrl.parse(html)
     ctx, doc = ixbrl.contexts(root), ixbrl.dei(root)
     strip_hidden(root)
-    sel = select(blocks(root))
+    sel = select(blocks(root), join_halves)
     return Built(render(sel), sel, root, ctx, doc)
 
 
@@ -418,7 +473,8 @@ def _section_elements(sel: Selection, section: str) -> list[etree._Element]:
     if section not in sel.statements:
         return []
     caption, table = sel.statements[section]
-    return [table.el, *(b.el for b in caption)]
+    second = [sel.continued[section].el] if section in sel.continued else []
+    return [table.el, *second, *(b.el for b in caption)]
 
 
 def coverage(sel: Selection, root: etree._Element, ctx: dict, gold: dict) -> dict:

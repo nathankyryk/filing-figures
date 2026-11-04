@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 
 from filing_figures import prompts
-from filing_figures.labels import FIELD_NAMES
+from filing_figures.labels import field_names
 
 PARTS = ("value", "scale", "period_end", "fiscal_year")
 _PROBE = "FILING_FIGURES_PROBE"
@@ -21,9 +21,9 @@ _PROBE = "FILING_FIGURES_PROBE"
 
 def answer_text(rec: dict) -> tuple[str, list[tuple[int, int]]]:
     """The gold answer exactly as `json.dumps` writes it, and the character spans of the blank
-    fields' values (the parts the loss skips)."""
+    fields' values (the parts the loss skips). Keys in the task's order, the order the prompt asks for."""
     text, hidden = "{", []
-    for i, name in enumerate(FIELD_NAMES):
+    for i, name in enumerate(field_names(rec.get("task", "v1"))):
         gold = rec["gold"][name]
         part = {k: (gold[k] if gold else None) for k in PARTS}
         text += ("" if i == 0 else ", ") + json.dumps(name) + ": "
@@ -37,7 +37,10 @@ def answer_text(rec: dict) -> tuple[str, list[tuple[int, int]]]:
 def chat_prompt(tokenizer, rec: dict) -> str:
     """The prompt as vLLM renders it for a chat request with thinking off."""
     return tokenizer.apply_chat_template(
-        prompts.messages(rec["input"]), tokenize=False, add_generation_prompt=True, enable_thinking=False
+        prompts.messages(rec["input"], rec.get("task", "v1")),
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
     )
 
 

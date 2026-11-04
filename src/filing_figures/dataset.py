@@ -1,8 +1,10 @@
 """One record per 10-K: the model input, the gold answer and everything needed to check and score it.
 
 A field's gold answer is scored only when its tagged number is inside the input the model sees
-(`in_input`), so a miss by the statement finder never counts against a model. A filing missing
-three or more of its six fields is left out entirely (`usable` is False); the counts go in the README.
+(`in_input`), so a miss by the statement finder never counts against a model. A filing with more
+unscorable fields than `MAX_MISSING` allows (v1: 3 of 6; v2: 5 of 12) is left out entirely (`usable` is
+False); the counts go in the README. A derived field (free cash flow) is scored only when both its
+parts are, and is computed from them as scored.
 """
 
 from __future__ import annotations
@@ -14,11 +16,12 @@ from collections import Counter
 from pathlib import Path
 
 from filing_figures import inputs
-from filing_figures.labels import FIELD_NAMES, label_filing
+from filing_figures.labels import FIELD_BY_NAME, field_names, label_filing
 
-MAX_MISSING = 2  # a filing with more unscorable fields than this is dropped
+MAX_MISSING = {"v1": 2, "v2": 4}  # a filing with more unscorable fields than this is dropped
 SPLIT_SEED = 0
 SPLITS = ("train", "valid", "test")
+OOD_SPLITS = ("ood-valid", "ood-test")
 HANDCHECK_COLUMNS = ("id", "field", "verdict", "value", "scale", "period_end", "note", "checked_at")
 VERDICTS = ("ok", "fix", "drop")  # fix also covers adding a value where the key had none
 
@@ -40,10 +43,26 @@ def assign_splits(companies: list[dict], valid: float = 0.15, test: float = 0.15
     return out
 
 
-def build_record(filing: dict, companyfacts: dict, html: bytes) -> dict:
+def derived_gold(name: str, gold: dict, fiscal_year: int) -> dict | None:
+    """A derived field's gold from its parts' gold (minuend - subtrahend), or None if either is unscored."""
+    first, second = (gold.get(p) for p in FIELD_BY_NAME[name].parts)
+    if first is None or second is None:
+        return None
+    return {
+        "value": first["value"] - second["value"],
+        "scale": first["scale"],
+        "period_end": first["period_end"],
+        "fiscal_year": fiscal_year,
+        "tag": "derived",
+        "displayed": None,
+    }
+
+
+def build_record(filing: dict, companyfacts: dict, html: bytes, task: str = "v1") -> dict:
     """filing: a row of data/universe/filings.csv (cik, ticker, sector, accession, ...)."""
-    labelled = label_filing(companyfacts, filing["accession"], filing["report_date"])
-    built = inputs.build(html)
+    labelled = label_filing(companyfacts, filing["accession"], filing["report_date"], task)
+    names = field_names(task)
+    built = inputs.build(html, join_halves=task != "v1")
     sel, text, doc = built.selection, built.text, built.dei
 
     def covered(gold: dict) -> dict:
@@ -54,16 +73,25 @@ def build_record(filing: dict, companyfacts: dict, html: bytes) -> dict:
                 c["in_input"] = False
         return out
 
-    cov = covered(labelled["labels"])
+    derived = {n for n in names if FIELD_BY_NAME[n].kind == "derived"}
+    cov = covered({n: v for n, v in labelled["labels"].items() if n not in derived})
     try:
         fiscal_year = int(doc.get("DocumentFiscalYearFocus", ""))
     except ValueError:
         fiscal_year = labelled["fiscal_year"]
 
     gold, flags = {}, {}
-    for name in FIELD_NAMES:
-        label, c = labelled["labels"][name], cov[name]
+    for name in names:
+        label = labelled["labels"][name]
         flags[name] = list(labelled["flags"][name])
+        if name in derived:
+            # From the parts as scored (each may have switched to the tag its statement shows), and
+            # only when both are in the input: the model can't compute what it can't read.
+            gold[name] = derived_gold(name, gold, fiscal_year)
+            if gold[name] is None and "part_missing" not in flags[name]:
+                flags[name].append("part_missing")
+            continue
+        c = cov[name]
         if label is None:
             gold[name] = None
             continue
@@ -105,7 +133,7 @@ def build_record(filing: dict, companyfacts: dict, html: bytes) -> dict:
         record_flags.append("fy_disagree")
     if doc.get("DocumentType", "10-K") != "10-K" or doc.get("AmendmentFlag", "false").lower() == "true":
         record_flags.append("not_original_10k")
-    return {
+    rec = {
         "id": f"{filing['ticker']}-{fiscal_year}",
         "cik": int(filing["cik"]),
         "ticker": filing["ticker"],
@@ -122,9 +150,12 @@ def build_record(filing: dict, companyfacts: dict, html: bytes) -> dict:
         "gold": gold,
         "flags": flags,
         "record_flags": record_flags,
-        "usable": unscored <= MAX_MISSING and "not_original_10k" not in record_flags,
+        "usable": unscored <= MAX_MISSING[task] and "not_original_10k" not in record_flags,
         "context_facts": labelled["context_facts"],
     }
+    if task != "v1":  # v1 records keep their exact original shape
+        rec["task"] = task
+    return rec
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -164,7 +195,7 @@ def apply_handcheck(rec: dict, checks: dict[tuple[str, str], dict]) -> dict:
     """The record with the hand-check applied: `fix` replaces (or adds) the gold value, `drop`
     takes the field out of scoring, `ok` confirms it. Each leaves a `handcheck_*` flag."""
     rec = json.loads(json.dumps(rec))  # deep copy
-    for name in FIELD_NAMES:
+    for name in rec["gold"]:
         row = checks.get((rec["id"], name))
         if not row:
             continue
@@ -182,14 +213,26 @@ def apply_handcheck(rec: dict, checks: dict[tuple[str, str], dict]) -> dict:
                 "tag": old.get("tag", "handcheck"),
                 "displayed": None,
             }
+    # A derived field follows a fix or drop of its parts, unless it was hand-checked itself
+    for name in rec["gold"]:
+        field = FIELD_BY_NAME.get(name)
+        if field is None or field.kind != "derived" or (rec["id"], name) in checks:
+            continue
+        if any((rec["id"], p) in checks for p in field.parts):
+            rec["gold"][name] = derived_gold(name, rec["gold"], rec["fiscal_year"])
+            rec["flags"][name].append("handcheck_parts")
     return rec
 
 
-def export_splits(records_path: Path, out_dir: Path, handcheck_path: Path) -> dict[str, Counter]:
-    """data/export/{train,valid,test}.jsonl: the usable records, hand-check applied."""
-    checks = read_handcheck(handcheck_path)
-    by_split: dict[str, list[dict]] = {s: [] for s in SPLITS}
-    counts: dict[str, Counter] = {s: Counter() for s in SPLITS}
+def export_splits(records_path: Path, out_dir: Path, handcheck_path: Path | list[Path]) -> dict[str, Counter]:
+    """<out_dir>/<split>.jsonl: the usable records, hand-check applied. train, valid and test are
+    always written; the out-of-distribution splits only when the records have them. With several
+    hand-check files, a later file's row for the same (id, field) wins."""
+    checks: dict[tuple[str, str], dict] = {}
+    for path in [handcheck_path] if isinstance(handcheck_path, str | Path) else handcheck_path:
+        checks.update(read_handcheck(path))
+    by_split: dict[str, list[dict]] = {s: [] for s in SPLITS + OOD_SPLITS}
+    counts: dict[str, Counter] = {s: Counter() for s in SPLITS + OOD_SPLITS}
     for rec in read_jsonl(records_path):
         if "error" in rec or rec.get("split") not in by_split:
             continue
@@ -204,8 +247,9 @@ def export_splits(records_path: Path, out_dir: Path, handcheck_path: Path) -> di
         c["handchecked_fields"] += sum(any(x.startswith("handcheck_") for x in fl) for fl in rec["flags"].values())
         by_split[rec["split"]].append(rec)
     for split, recs in by_split.items():
-        write_jsonl(sorted(recs, key=lambda r: r["id"]), out_dir / f"{split}.jsonl")
-    return counts
+        if split in SPLITS or counts[split]["filings"]:
+            write_jsonl(sorted(recs, key=lambda r: r["id"]), out_dir / f"{split}.jsonl")
+    return {s: c for s, c in counts.items() if s in SPLITS or c["filings"]}
 
 
 def push_dataset(folder: Path, repo_id: str, token: str | None, message: str) -> str:
