@@ -244,6 +244,13 @@ def test_zero_width_spaces_are_dropped():
     assert "Total net sales | $ 391,035" in inputs.build(doc).text
 
 
+def test_comment_inside_a_text_block_is_skipped():
+    # RBC Bearings' FY2025 10-K: a comment beside a child block once crashed the text reader
+    doc = DOC.replace(b"<div>FORM 10-K</div>", b"<div>FORM <!-- page 1 -->10-K<div>Annual report</div></div>")
+    text = inputs.build(doc).text
+    assert "FORM 10-K" in text and "page 1" not in text
+
+
 def test_splits_are_by_company_and_seeded():
     companies = [{"cik": i, "sector": "A" if i % 2 else "B"} for i in range(100)]
     a, b = assign_splits(companies), assign_splits(companies)

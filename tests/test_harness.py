@@ -93,3 +93,47 @@ def test_provider_error_mid_answer_is_retried(tmp_path, monkeypatch):
     out = tmp_path / "flaky.jsonl"
     stats = predict(RECORDS[:1], Config(endpoint="stub", model="m", workers=1), out)
     assert calls == ["EXM-0", "EXM-0"] and stats["errors"] == 0 and abs(stats["cost"] - 0.02) < 1e-9
+
+
+# --- task v2: twelve fields, through the same client and scorer --------------------------------
+
+
+def v2_records():
+    from test_reward import rec_v2
+
+    recs = []
+    for i in range(2):
+        rec = rec_v2(f"EXV-{i}")
+        rec["cik"], rec["input"] = 100 + i, f"v2 filing text {i}"
+        rec["context_facts"] = [*PRIOR_FACTS, *rec["context_facts"][len(FACTS) :]]
+        recs.append(rec)
+    return recs
+
+
+def run_v2(mode, tmp_path):
+    recs = v2_records()
+    server = StubServer(recs, mode, port=0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        out = tmp_path / f"v2-{mode}.jsonl"
+        stats = predict(recs, Config(endpoint=server.url, model="stub", workers=2), out)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert stats["errors"] == 0
+    lines = [__import__("json").loads(x) for x in out.read_text(encoding="utf-8").splitlines()]
+    assert {x["prompt_version"] for x in lines} == {"v5"}
+    return score(recs, load_predictions(out))
+
+
+def test_v2_gold_answers_score_100(tmp_path):
+    rows = run_v2("gold", tmp_path)
+    assert len(rows) == 24 and all(r["correct"] and r["valid_json"] for r in rows)
+
+
+def test_v2_prior_answers_are_each_kinds_near_miss(tmp_path):
+    cats = {r["field"]: r["category"] for r in run_v2("prior", tmp_path) if r["id"] == "EXV-0"}
+    assert cats["revenue"] == cats["total_assets"] == cats["net_income"] == "wrong_period"
+    assert cats["revenue_prior"] == "wrong_period"  # this year's revenue
+    assert cats["fcf"] == "wrong_line_item"  # operating cash flow, capex not subtracted
+    assert cats["shares_outstanding"] == "missing"

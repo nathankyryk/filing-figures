@@ -35,6 +35,21 @@ quant = [
 serve = [
     "vllm==0.32.0; sys_platform == 'linux'",
 ]
+# GRPO (task v2): TRL's trainer with vLLM in the same process (torch and transformers resolve to
+# the serve environment's versions). TRL is pinned exactly: rl.py replaces one of its private
+# methods. fla: Qwen3.5's linear-attention kernels, ~10x faster than the fallback for training.
+rl = [
+    "trl==1.17.1; sys_platform == 'linux'",
+    "peft==0.21.2; sys_platform == 'linux'",
+    "vllm==0.32.0; sys_platform == 'linux'",
+    "flash-linear-attention==0.6.0; sys_platform == 'linux'",
+]
+# The fallback GRPO stack: Unsloth's trainer with its own vLLM engine
+rl-unsloth = [
+    "unsloth==2026.10.11; sys_platform == 'linux'",
+    "unsloth-zoo==2026.10.11; sys_platform == 'linux'",
+    "vllm==0.33.0; sys_platform == 'linux'",
+]
 
 [project.scripts]
 figures = "filing_figures.cli:app"
@@ -50,7 +65,9 @@ dev = [
 ]
 
 [tool.uv]
-conflicts = [[{ extra = "train" }, { extra = "quant" }, { extra = "serve" }]]
+conflicts = [[
+    { extra = "train" }, { extra = "quant" }, { extra = "serve" }, { extra = "rl" }, { extra = "rl-unsloth" },
+]]
 environments = ["sys_platform == 'win32'", "sys_platform == 'linux' and platform_machine == 'x86_64'"]
 
 [tool.pytest.ini_options]

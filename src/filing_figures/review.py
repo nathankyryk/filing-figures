@@ -1,6 +1,6 @@
-"""The hand-check page: check the test split's answer key by eye, one filing at a time.
+"""The hand-check page: check a final split's answer key by eye, one filing at a time.
 
-`figures review` serves it on 127.0.0.1. Each filing shows its six gold values next to the input
+`figures review` serves it on 127.0.0.1. Each filing shows its gold values next to the input
 lines they came from, the other tagged values for the same period, and a link to the filing on
 EDGAR. Verdicts go to labels/handcheck.csv (see `dataset.apply_handcheck`); `figures export`
 applies them.
@@ -8,6 +8,11 @@ applies them.
 The pool (labels/handcheck_pool.csv, drawn once and kept): a seeded random sample of test filings,
 whose fix rate is an unbiased estimate of the answer key's error rate, plus the filings with a flag
 that can change a score, most important first, up to `target` filings.
+
+Task v2 (`figures review --task v2`): the ood-test split, all twelve fields, its own files
+(labels/handcheck_v2_pool.csv, labels/handcheck_v2.csv). Besides the flags, a filing is flagged
+when a field's answer key fell into one of v2's traps (TRAPS: e.g. equity taken from the tag that
+includes noncontrolling interests). Free cash flow isn't checked: it follows its two parts.
 """
 
 from __future__ import annotations
@@ -26,7 +31,15 @@ from urllib.parse import parse_qs, urlparse
 
 from filing_figures.dataset import VERDICTS, read_handcheck, write_handcheck
 from filing_figures.evaluate import close
-from filing_figures.labels import FIELD_NAMES, FIELDS, MAX_YEAR_DAYS, MIN_YEAR_DAYS
+from filing_figures.labels import (
+    CAPEX,
+    FIELD_BY_NAME,
+    FIELD_NAMES,
+    MAX_YEAR_DAYS,
+    MIN_YEAR_DAYS,
+    PER_SHARE,
+    task_fields,
+)
 from filing_figures.schema import SCALE_POWER, SCALES
 
 PORT = 7862
@@ -34,10 +47,35 @@ POOL_COLUMNS = ("order", "id", "reason")
 # Flags worth a look, most important first. multi_tag and tag_from_statement count only when the
 # other tag's value would score differently (e.g. net income including noncontrolling interests).
 REVIEW_FLAGS = ("conflict", "mismatch", "date_from_text", "tag_from_statement", "multi_tag")
-KIND = {f.name: f.kind for f in FIELDS}
-OWN_TAGS = {f.name: f.tags for f in FIELDS}
+KIND = {name: f.kind for name, f in FIELD_BY_NAME.items()}  # v1's fields are v2's first six
+OWN_TAGS = {name: f.tags for name, f in FIELD_BY_NAME.items()}
+# Task v2's traps: an answer key taken from a tag that a careful reader of the statement might not
+# pick. Each is worth a look whatever the flags say. capex: any tag after the first choice.
+TRAPS = {
+    "net_income": {"us-gaap:ProfitLoss": "with_nci"},
+    "equity": {"us-gaap:StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest": "with_nci"},
+    "cash": {"us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents": "with_restricted"},
+    "eps_basic": {"us-gaap:EarningsPerShareBasicAndDiluted": "basic_and_diluted"},
+    "eps_diluted": {"us-gaap:EarningsPerShareBasicAndDiluted": "basic_and_diluted"},
+    "capex": dict.fromkeys(CAPEX.tags[1:], "fallback_tag"),
+}
+_OCF, _CAPEX = OWN_TAGS["operating_cash_flow"], OWN_TAGS["capex"]
 RELATED = {  # tags shown next to each gold value, for the same period
     **OWN_TAGS,
+    "cash": (*OWN_TAGS["cash"], "us-gaap:RestrictedCashAndCashEquivalentsAtCarryingValue"),
+    "equity": (*OWN_TAGS["equity"], "us-gaap:MinorityInterest"),
+    "eps_basic": (
+        "us-gaap:EarningsPerShareBasic",
+        "us-gaap:EarningsPerShareBasicAndDiluted",
+        "us-gaap:EarningsPerShareDiluted",
+    ),
+    "capex": (
+        *_CAPEX,
+        "us-gaap:PaymentsToAcquireBusinessesNetOfCashAcquired",
+        "us-gaap:PaymentsToAcquireIntangibleAssets",
+        "us-gaap:PaymentsToDevelopSoftware",
+    ),
+    "fcf": (*_OCF, *_CAPEX),  # its two parts
     "net_income": (
         "us-gaap:NetIncomeLoss",
         "us-gaap:NetIncomeLossAvailableToCommonStockholdersBasic",
@@ -67,13 +105,17 @@ def _days(start: str, end: str) -> int:
 
 
 def related_facts(rec: dict, name: str) -> list[dict]:
-    """Facts of the field's related tags for the filing's current period (shares: on or after it)."""
+    """Facts of the field's related tags for the filing's current period (shares: on or after it;
+    revenue_prior: the year before)."""
     period_end, out, seen = rec["period_end"], [], set()
     for f in rec["context_facts"]:
         if f["tag"] not in RELATED[name]:
             continue
-        if KIND[name] == "year":
+        if KIND[name] in ("year", "derived"):
             ok = f["start"] and f["end"] == period_end and MIN_YEAR_DAYS <= _days(f["start"], f["end"]) <= MAX_YEAR_DAYS
+        elif KIND[name] == "prior_year":
+            year_long = f["start"] and MIN_YEAR_DAYS <= _days(f["start"], f["end"]) <= MAX_YEAR_DAYS
+            ok = year_long and MIN_YEAR_DAYS <= _days(f["end"], period_end) - 1 <= MAX_YEAR_DAYS
         elif KIND[name] == "instant":
             ok = not f["start"] and f["end"] == period_end
         else:
@@ -86,10 +128,11 @@ def related_facts(rec: dict, name: str) -> list[dict]:
     return sorted(out, key=lambda f: (order[f["tag"]], f["end"]))
 
 
-def review_reasons(rec: dict) -> list[str]:
-    """ "field:flag" for each flag that can change this filing's score."""
+def review_reasons(rec: dict, task: str = "v1") -> list[str]:
+    """ "field:flag" for each flag that can change this filing's score (v2: and each trap)."""
     out = []
-    for name in FIELD_NAMES:
+    for field in task_fields(task):
+        name = field.name
         gold, flags = rec["gold"][name], rec["flags"][name]
         for flag in REVIEW_FLAGS:
             if flag not in flags:
@@ -99,7 +142,15 @@ def review_reasons(rec: dict) -> list[str]:
                 if not gold or all(close(v, gold["value"], name) for v in others):
                     continue
             out.append(f"{name}:{flag}")
+        trap = TRAPS.get(name, {}).get(gold and gold["tag"]) if task == "v2" else None
+        if trap:
+            out.append(f"{name}:{trap}")
     return out
+
+
+def checked_fields(task: str = "v1") -> tuple[str, ...]:
+    """The fields a filing's hand-check covers: all but the derived ones, which follow their parts."""
+    return tuple(f.name for f in task_fields(task) if f.kind != "derived")
 
 
 def _rank(reasons: list[str]) -> int:
@@ -111,11 +162,13 @@ def _rank(reasons: list[str]) -> int:
     return 2
 
 
-def build_pool(records: list[dict], target: int = 100, n_random: int = 40, seed: int = 0) -> list[dict]:
+def build_pool(
+    records: list[dict], target: int = 100, n_random: int = 40, seed: int = 0, task: str = "v1"
+) -> list[dict]:
     """[{order, id, reason}]: n_random seeded random filings, then flagged ones, most important first."""
     rng = random.Random(seed)
     ids = sorted(r["id"] for r in records)
-    reasons = {r["id"]: review_reasons(r) for r in records}
+    reasons = {r["id"]: review_reasons(r, task) for r in records}
     picked = rng.sample(ids, min(n_random, len(ids)))
     rows = [(i, ";".join(["random", *reasons[i]])) for i in picked]
     rest = [i for i in ids if i not in set(picked) and reasons[i]]
@@ -161,11 +214,11 @@ def parse_printed(text: str) -> Decimal:
     return -d if negative else d
 
 
-def summary(pool: list[dict], checks: dict[tuple[str, str], dict]) -> dict:
+def summary(pool: list[dict], checks: dict[tuple[str, str], dict], names: tuple[str, ...] = FIELD_NAMES) -> dict:
     """Progress, and fixes per field in the random part of the pool (the answer key's error rate)."""
     out = {"filings": len(pool), "filings_done": 0, "verdicts": Counter(), "random_fields": 0, "random_changed": 0}
     for row in pool:
-        verdicts = [checks.get((row["id"], n), {}).get("verdict") for n in FIELD_NAMES]
+        verdicts = [checks.get((row["id"], n), {}).get("verdict") for n in names]
         out["filings_done"] += all(verdicts)
         out["verdicts"].update(v for v in verdicts if v)
         if row["reason"].startswith("random"):
@@ -175,29 +228,37 @@ def summary(pool: list[dict], checks: dict[tuple[str, str], dict]) -> dict:
 
 
 class Review:
-    def __init__(self, records: list[dict], pool: list[dict], handcheck_path: Path):
+    def __init__(self, records: list[dict], pool: list[dict], handcheck_path: Path, task: str = "v1"):
         self.records = {r["id"]: r for r in records}
         self.pool = [p for p in pool if p["id"] in self.records]
         self.path = Path(handcheck_path)
         self.lock = threading.Lock()
         self.checks = read_handcheck(self.path)
+        self.fields = task_fields(task)  # shown
+        self.names = checked_fields(task)  # given a verdict
+
+    def summary(self) -> dict:
+        return summary(self.pool, self.checks, self.names)
 
     def pool_view(self) -> list[dict]:
         out = []
         for p in self.pool:
-            done = sum((p["id"], n) in self.checks for n in FIELD_NAMES)
-            out.append({**p, "done": done, "fields": len(FIELD_NAMES)})
+            done = sum((p["id"], n) in self.checks for n in self.names)
+            out.append({**p, "done": done, "fields": len(self.names)})
         return out
 
     def record_view(self, rid: str) -> dict:
         rec = self.records[rid]
         lines = rec["input"].split("\n")
         fields = []
-        for name in FIELD_NAMES:
-            gold = rec["gold"][name]
+        for field in self.fields:
+            name, gold = field.name, rec["gold"][field.name]
             fields.append(
                 {
                     "name": name,
+                    "kind": field.kind,
+                    "per_share": name in PER_SHARE,
+                    "parts": list(field.parts),  # a derived field: computed from these, not checked
                     "gold": gold,
                     "flags": rec["flags"][name],
                     "lines": _matching_lines(lines, gold and gold["displayed"]),
@@ -220,8 +281,8 @@ class Review:
         rid, name, verdict = body.get("id"), body.get("field"), body.get("verdict")
         if rid not in self.records or not any(p["id"] == rid for p in self.pool):
             raise ValueError("unknown filing")
-        if name not in FIELD_NAMES:
-            raise ValueError("unknown field")
+        if name not in self.names:
+            raise ValueError("unknown field" if name not in FIELD_BY_NAME else f"{name} follows its parts")
         if verdict not in (*VERDICTS, ""):
             raise ValueError("unknown verdict")
         note = str(body.get("note") or "")[:MAX_NOTE]
@@ -289,7 +350,7 @@ def _handler(review: Review, port: int):
             elif url.path == "/app.css":
                 self._send(200, STYLE.encode(), "text/css; charset=utf-8")
             elif url.path == "/api/pool":
-                self._json(200, {"pool": review.pool_view(), "summary": _jsonable(summary(review.pool, review.checks))})
+                self._json(200, {"pool": review.pool_view(), "summary": _jsonable(review.summary())})
             elif url.path == "/api/record":
                 rid = parse_qs(url.query).get("id", [""])[0]
                 if rid not in review.records:
@@ -462,7 +523,7 @@ function fieldRow(f) {
   const g = f.gold;
   const verdict = f.check ? el("span", {class: "v-" + f.check.verdict}, f.check.verdict +
     (f.check.verdict === "fix" ? ` → ${fmt(f.check.value)} (${f.check.scale}, ${f.check.period_end})` : "")) : el("span", {}, "-");
-  const cell = el("td", {}, verdict, el("div", {class: "bar"},
+  const cell = f.parts.length ? el("td", {class: "related"}, "follows " + f.parts.join(" − ")) : el("td", {}, verdict, el("div", {class: "bar"},
     el("button", {onclick: e => { e.stopPropagation(); save(f.name, "ok"); }}, "OK"),
     el("button", {onclick: e => { e.stopPropagation(); showFix(f, cell); }}, g ? "Fix" : "Add"),
     g ? el("button", {onclick: e => { e.stopPropagation(); save(f.name, "drop"); }}, "Drop") : null,
@@ -472,7 +533,7 @@ function fieldRow(f) {
   const flags = f.flags.filter(x => x !== "missing" || !g);
   const tr = el("tr", {class: "field" + (selField === f.name ? " sel" : ""), onclick: () => select(f.name)},
     el("td", {}, el("b", {}, f.name), f.lines.length ? null : el("div", {class: "related"}, g ? "not found in input" : "")),
-    el("td", {}, g ? el("div", {}, shown(g), el("div", {class: "related"}, `printed "${g.displayed}" = ${fmt(g.value)}`),
+    el("td", {}, g ? el("div", {}, shown(g), el("div", {class: "related"}, g.displayed === null ? `= ${fmt(g.value)}` : `printed "${g.displayed}" = ${fmt(g.value)}`),
         ...f.lines.slice(0, 2).map(i => el("div", {class: "snip", title: "input line " + (i + 1)}, rec.lines[i]))) : el("i", {}, "unscored")),
     el("td", {class: "date"}, g ? g.period_end : ""),
     el("td", {}, g ? g.tag.split(":")[1] : "", el("div", {class: "flags"}, flags.join(", "))),
@@ -484,8 +545,8 @@ function fieldRow(f) {
 function showFix(f, cell) {
   const g = f.gold || {};
   const printed = el("input", {placeholder: "as printed, e.g. (1,234.5)", size: "18", value: g.displayed || ""});
-  const scale = el("select", {}, ...SCALES.map(s => { const o = el("option", {value: s}, s); if (s === (g.scale || (f.name === "eps_diluted" ? "units" : "millions"))) o.selected = true; return o; }));
-  const period = el("input", {placeholder: "YYYY-MM-DD", size: "11", value: g.period_end || (f.name === "shares_outstanding" ? "" : rec.period_end)});
+  const scale = el("select", {}, ...SCALES.map(s => { const o = el("option", {value: s}, s); if (s === (g.scale || (f.per_share ? "units" : "millions"))) o.selected = true; return o; }));
+  const period = el("input", {placeholder: "YYYY-MM-DD", size: "11", value: g.period_end || (f.kind === "cover" || f.kind === "prior_year" ? "" : rec.period_end)});
   const note = el("input", {placeholder: "why (optional)", size: "24"});
   const msg = el("span", {class: "err"});
   const form = el("form", {class: "fix", onclick: e => e.stopPropagation(), onsubmit: async e => {
@@ -507,7 +568,7 @@ async function save(field, verdict, extra) {
 }
 
 async function allOk() {
-  for (const f of rec.fields) if (!f.check) await api("/api/check", {id: rec.id, field: f.name, verdict: "ok"});
+  for (const f of rec.fields) if (!f.check && !f.parts.length) await api("/api/check", {id: rec.id, field: f.name, verdict: "ok"});
   await loadPool();
   const i = pool.findIndex(p => p.id === rec.id);
   const next = pool.slice(i + 1).concat(pool.slice(0, i)).find(p => p.done < p.fields);

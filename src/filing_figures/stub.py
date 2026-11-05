@@ -1,8 +1,11 @@
 """A stand-in model server (OpenAI chat API) for testing the harness without a GPU.
 
-It recognises each filing by its text and answers in one of three modes:
+It recognises each filing by its text and answers in one of three modes, for the record's own
+task (v1: six fields, v2: twelve):
   gold    the answer key itself: must score 100%
-  prior   the prior year's values from the same 10-K: must score as "wrong_period"
+  prior   a plausible mistake per field: the prior year's value from the same 10-K ("wrong_period");
+          for last year's revenue, this year's ("wrong_period"); for free cash flow, operating cash
+          flow with capex not subtracted ("wrong_line_item"). Cover-page shares are left blank.
   garbage text that is not JSON: must score as "invalid_json"
 """
 
@@ -13,10 +16,10 @@ import json
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from filing_figures.labels import FIELD_NAMES, FIELDS, MAX_YEAR_DAYS, MIN_YEAR_DAYS
+from filing_figures.labels import FIELD_BY_NAME, MAX_YEAR_DAYS, MIN_YEAR_DAYS, field_names
 
 MODES = ("gold", "prior", "garbage")
-KINDS = {f.name: f.kind for f in FIELDS}
+KINDS = {name: f.kind for name, f in FIELD_BY_NAME.items()}
 
 
 def _key(text: str) -> str:
@@ -27,24 +30,39 @@ def _part(value, scale, period_end, fiscal_year) -> dict:
     return {"value": value, "scale": scale, "period_end": period_end, "fiscal_year": fiscal_year}
 
 
+def _is_year(f: dict) -> bool:
+    if not f["start"]:
+        return False
+    days = (date.fromisoformat(f["end"]) - date.fromisoformat(f["start"])).days + 1
+    return MIN_YEAR_DAYS <= days <= MAX_YEAR_DAYS
+
+
 def _prior(rec: dict, name: str) -> dict | None:
-    """The same tag's value for the latest earlier period of the same kind, if the 10-K has one."""
+    """The near miss `prior` mode gives for one field (a fact-shaped dict: val, end), or None."""
     gold = rec["gold"][name]
     kind = KINDS[name]
     if kind == "cover":
         return None  # a 10-K files only this year's cover share count
+    if kind == "derived":  # free cash flow: the first part alone, the second not subtracted
+        first = rec["gold"].get(FIELD_BY_NAME[name].parts[0])
+        return first and {"val": first["value"], "end": first["period_end"]}
+    if kind == "prior_year":  # last year's revenue: this year's figure instead
+        return next(
+            (
+                f
+                for f in rec["context_facts"]
+                if f["tag"] == gold["tag"] and f["end"] == rec["period_end"] and _is_year(f)
+            ),
+            None,
+        )
     best = None
     for f in rec["context_facts"]:
         if f["tag"] != gold["tag"] or f["end"] >= gold["period_end"]:
             continue
         if kind == "instant" and f["start"] is not None:
             continue
-        if kind == "year":
-            if not f["start"]:
-                continue
-            days = (date.fromisoformat(f["end"]) - date.fromisoformat(f["start"])).days + 1
-            if not MIN_YEAR_DAYS <= days <= MAX_YEAR_DAYS:
-                continue
+        if kind == "year" and not _is_year(f):
+            continue
         if best is None or f["end"] > best["end"]:
             best = f
     return best
@@ -54,7 +72,7 @@ def answer(rec: dict, mode: str) -> str:
     if mode == "garbage":
         return "Revenue was strong this year."
     out = {}
-    for name in FIELD_NAMES:
+    for name in field_names(rec.get("task", "v1")):
         g = rec["gold"][name]
         if g is None:
             out[name] = _part(None, None, None, None)
@@ -62,10 +80,10 @@ def answer(rec: dict, mode: str) -> str:
             out[name] = _part(g["value"], g["scale"], g["period_end"], g["fiscal_year"])
         else:
             p = _prior(rec, name)
+            # The year written for an earlier period's value is the earlier year (v1's behavior)
+            fiscal_year = g["fiscal_year"] - 1 if KINDS[name] in ("year", "instant") else g["fiscal_year"]
             out[name] = (
-                _part(None, None, None, None)
-                if p is None
-                else _part(p["val"], g["scale"], p["end"], g["fiscal_year"] - 1)
+                _part(None, None, None, None) if p is None else _part(p["val"], g["scale"], p["end"], fiscal_year)
             )
     return json.dumps(out)
 

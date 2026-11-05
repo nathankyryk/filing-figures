@@ -43,6 +43,23 @@ def assign_splits(companies: list[dict], valid: float = 0.15, test: float = 0.15
     return out
 
 
+def assign_ood_splits(companies: list[dict], valid: float = 0.4, seed: int = SPLIT_SEED) -> dict:
+    """{cik: "ood-valid" | "ood-test"} for the out-of-distribution companies, by company, stratified
+    by sector, seeded. ood-valid helps pick checkpoints; ood-test is scored once."""
+    rng = random.Random(seed)
+    by_sector: dict[str, list[int]] = {}
+    for c in companies:
+        by_sector.setdefault(c["sector"], []).append(int(c["cik"]))
+    out = {}
+    for sector in sorted(by_sector):
+        ciks = sorted(by_sector[sector])
+        rng.shuffle(ciks)
+        n_valid = round(len(ciks) * valid)
+        for i, cik in enumerate(ciks):
+            out[cik] = "ood-valid" if i < n_valid else "ood-test"
+    return out
+
+
 def derived_gold(name: str, gold: dict, fiscal_year: int) -> dict | None:
     """A derived field's gold from its parts' gold (minuend - subtrahend), or None if either is unscored."""
     first, second = (gold.get(p) for p in FIELD_BY_NAME[name].parts)

@@ -17,7 +17,13 @@ OUT = Path(os.environ.get("FIGURES_OUT", "outputs"))  # the pod's check stage wr
 HANDCHECK = Path("labels") / "handcheck.csv"
 # v2 reuses v1's checks (same filings, same six fields) and adds its own for the new fields
 HANDCHECKS = {"v1": [HANDCHECK], "v2": [HANDCHECK, Path("labels") / "handcheck_v2.csv"]}
-HF_DATASET = "kyryk/filing-figures"
+OOD = DATA / "universe" / "ood"  # the out-of-distribution companies and filings (task v2)
+TASK_HELP = "Task version: v1 (6 fields) or v2 (12)"
+TASK_SPLITS = {"v1": ("train", "valid", "test"), "v2": ("train", "valid", "test", "ood-valid", "ood-test")}
+# Scored once, at the end: a run on these needs --final and is logged
+FINAL_SPLITS = ("test", "ood-test")
+# The splits a checkpoint is picked on: v2 pools in-distribution and out-of-distribution validation
+PICK_SPLITS = {"v1": ("valid",), "v2": ("valid", "ood-valid")}
 
 
 @app.callback()
@@ -82,11 +88,68 @@ def split() -> None:
     typer.echo(filings["split"].value_counts().to_string())
 
 
-def _filings(limit: int | None, tickers: str | None, split: str | None = None) -> pd.DataFrame:
+@app.command("ood-universe")
+def ood_universe(
+    n: int = typer.Option(200, help="Companies to sample"),
+    seed: int = typer.Option(0, help="Sampling seed"),
+) -> None:
+    """The out-of-distribution set for task v2 (data/universe/ood/): FY2025 10-Ks of S&P MidCap 400
+    companies outside v1's S&P 500 list, split by company into ood-valid and ood-test."""
+    import json
+
+    from filing_figures.dataset import assign_ood_splits
+    from filing_figures.universe import (
+        OOD_YEAR,
+        TICKERS_URL,
+        choose_companies,
+        fetch_sp400,
+        list_10ks,
+        save_csv,
+        ticker_ciks,
+    )
+
+    edgar = _edgar()
+    sp400_path = OOD / "sp400.csv"
+    if sp400_path.exists():  # keep the first download: the list changes as the index does
+        sp400 = pd.read_csv(sp400_path, dtype={"cik": "Int64"})
+    else:
+        sp400 = fetch_sp400(ticker_ciks(json.loads(edgar.cached(TICKERS_URL, Path("company_tickers.json.gz")))))
+        save_csv(sp400, sp400_path)
+    unresolved = sp400[sp400["cik"].isna()]
+    in_v1 = set(pd.read_csv(DATA / "universe" / "sp500.csv")["cik"])
+    pool = sp400.dropna(subset=["cik"]).astype({"cik": int})
+    pool = pool[~pool["cik"].isin(in_v1)]
+    companies = choose_companies(pool, n, seed)
+    rows, kept = [], []
+    with typer.progressbar(companies.itertuples(), length=len(companies), label="companies") as bar:
+        for c in bar:
+            filings = list_10ks(edgar.submissions(c.cik), edgar.companyfacts(c.cik), OOD_YEAR, OOD_YEAR)
+            if filings:
+                kept.append(c.cik)
+                rows += [{"cik": c.cik, "ticker": c.ticker, "sector": c.sector, **f} for f in filings]
+    companies = companies[companies["cik"].isin(kept)].copy()
+    companies["split"] = companies["cik"].map(assign_ood_splits(companies.to_dict("records")))
+    save_csv(companies, OOD / "companies.csv")
+    save_csv(companies[["cik", "ticker", "sector", "split"]], OOD / "splits.csv")
+    save_csv(pd.DataFrame(rows), OOD / "filings.csv")
+    typer.echo(
+        f"{len(sp400)} S&P 400 rows ({len(unresolved)} without a CIK) -> {len(pool)} outside v1's list "
+        f"-> {len(companies)} of {min(n, len(pool))} sampled have an FY{OOD_YEAR} inline-XBRL 10-K"
+    )
+    typer.echo(companies["split"].value_counts().to_string())
+    typer.echo(companies.groupby(["sector", "split"]).size().unstack(fill_value=0).to_string())
+
+
+def _filings(limit: int | None, tickers: str | None, split: str | None = None, ood: bool = False) -> pd.DataFrame:
+    """The filings to work on. `ood` adds the out-of-distribution set (task v2 only, so v1 never changes)."""
     df = pd.read_csv(DATA / "universe" / "filings.csv", dtype={"accession": str})
     splits_path = DATA / "universe" / "splits.csv"
     if splits_path.exists():
         df = df.merge(pd.read_csv(splits_path)[["cik", "split"]], on="cik", how="left")
+    if ood and (OOD / "filings.csv").exists():
+        extra = pd.read_csv(OOD / "filings.csv", dtype={"accession": str})
+        extra = extra.merge(pd.read_csv(OOD / "splits.csv")[["cik", "split"]], on="cik", how="left")
+        df = pd.concat([df, extra], ignore_index=True)
     if split:
         df = df[df["split"].isin(split.split(","))]
     if tickers:
@@ -105,7 +168,7 @@ def download(
     from concurrent.futures import ThreadPoolExecutor
 
     edgar = _edgar()
-    df = _filings(limit, tickers, split)
+    df = _filings(limit, tickers, split, ood=True)
     failed = []
 
     def get(row):
@@ -152,7 +215,7 @@ def build(
     tickers: str = typer.Option(None, help="Comma-separated tickers"),
     workers: int = typer.Option(4, help="Processes"),
     task: str = typer.Option("v1", help="Task version: v1 (6 fields) or v2 (12)"),
-    out: Path = typer.Option(None, help="Output JSONL [default: data/build[/<task>]/records.jsonl]"),
+    out: Path = typer.Option(None, help="Output JSONL [default: data/build(/<task>)/records.jsonl]"),
 ) -> None:
     """Labels + model input + coverage for every cached filing, then a coverage summary."""
     import json
@@ -164,7 +227,7 @@ def build(
 
     names = field_names(task)
     out = out or _task_dir(task, DATA / "build") / "records.jsonl"
-    rows = _filings(limit, tickers, split).to_dict("records")
+    rows = _filings(limit, tickers, split, ood=task != "v1").to_dict("records")
     out.parent.mkdir(parents=True, exist_ok=True)
     errors, flag_counts = [], Counter()
     usable, total, in_input, labelled = Counter(), Counter(), Counter(), Counter()  # keyed by (split, field)
@@ -214,8 +277,8 @@ def build(
 @app.command()
 def export(
     task: str = typer.Option("v1", help="Task version: v1 or v2"),
-    records: Path = typer.Option(None, help="Output of `build` [default: data/build[/<task>]/records.jsonl]"),
-    out: Path = typer.Option(None, help="Folder for <split>.jsonl [default: data/export[/<task>]]"),
+    records: Path = typer.Option(None, help="Output of `build` [default: data/build(/<task>)/records.jsonl]"),
+    out: Path = typer.Option(None, help="Folder for <split>.jsonl [default: data/export(/<task>)]"),
 ) -> None:
     """Write the usable records of each split, with the hand-check (labels/handcheck*.csv) applied."""
     from filing_figures.dataset import export_splits
@@ -231,22 +294,28 @@ def export(
 
 @app.command()
 def push(
-    repo: str = typer.Option(HF_DATASET, help="Hugging Face dataset repo"),
-    folder: Path = typer.Option(DATA / "export"),
+    task: str = typer.Option("v1", help=TASK_HELP),
+    repo: str = typer.Option(None, help="Hugging Face dataset repo [default: the task's, runs.DATASETS]"),
+    folder: Path = typer.Option(None, help="[default: data/export(/<task>)]"),
     message: str = typer.Option("Update the dataset", help="Commit message"),
 ) -> None:
     """Upload the export to Hugging Face (created private; publishing is a separate step)."""
     from filing_figures.dataset import push_dataset
+    from filing_figures.runs import DATASETS
 
+    repo = repo or DATASETS[task]
+    folder = folder or _task_dir(task, DATA / "export")
     typer.echo(push_dataset(folder, repo, os.environ.get("HF_TOKEN"), message))
 
 
-def _records(split: str, sample: int | None = None, seed: int = 0, ids: str | None = None) -> list[dict]:
+def _records(
+    split: str, sample: int | None = None, seed: int = 0, ids: str | None = None, task: str = "v1"
+) -> list[dict]:
     import random
 
     from filing_figures.dataset import read_jsonl
 
-    recs = read_jsonl(DATA / "export" / f"{split}.jsonl")
+    recs = read_jsonl(_task_dir(task, DATA / "export") / f"{split}.jsonl")
     if ids:
         keep = set(ids.split(","))
         recs = [r for r in recs if r["id"] in keep]
@@ -255,8 +324,17 @@ def _records(split: str, sample: int | None = None, seed: int = 0, ids: str | No
     return recs
 
 
-def _preds_path(split: str, run: str) -> Path:
-    return OUT / "preds" / split / f"{run}.jsonl"
+def _check_split(split: str, final: bool) -> None:
+    if split in FINAL_SPLITS and not final:
+        raise typer.BadParameter(f"the {split} split is for the final runs only: pass --final")
+
+
+def _preds_path(split: str, run: str, task: str = "v1") -> Path:
+    return _task_dir(task, OUT / "preds") / split / f"{run}.jsonl"
+
+
+def _scores_path(split: str, run: str, task: str = "v1") -> Path:
+    return _task_dir(task, OUT / "scores") / split / f"{run}.json"
 
 
 @app.command()
@@ -276,15 +354,15 @@ def predict(
     no_temperature: bool = typer.Option(False, help="Don't send a temperature (some API models reject it)"),
     max_cost: float = typer.Option(None, help="USD: no new requests once this much is spent"),
     extra: str = typer.Option(None, help="JSON merged into each request body"),
-    final: bool = typer.Option(False, help="Allow the test split; the run is logged"),
+    final: bool = typer.Option(False, help="Allow the test and ood-test splits; the run is logged"),
+    task: str = typer.Option("v1", help=TASK_HELP),
 ) -> None:
-    """Ask a model about each filing (outputs/preds/<split>/<run>.jsonl), then score it."""
+    """Ask a model about each filing (outputs/preds(/<task>)/<split>/<run>.jsonl), then score it."""
     import json
 
     from filing_figures.client import Config
 
-    if split == "test" and not final:
-        raise typer.BadParameter("the test split is for the final runs only: pass --final")
+    _check_split(split, final)
     run = run or (model or endpoint).replace("/", "_").replace(":", "_")
     cfg = Config(
         endpoint=endpoint,
@@ -297,36 +375,41 @@ def predict(
         max_cost=max_cost,
         extra_body=json.loads(extra) if extra else {},
     )
-    _predict_and_score(cfg, split, run, sample, seed, ids)
+    _predict_and_score(cfg, split, run, sample, seed, ids, task)
 
 
-def _predict_and_score(cfg, split: str, run: str, sample: int | None, seed: int, ids: str | None) -> None:
+def _predict_and_score(
+    cfg, split: str, run: str, sample: int | None, seed: int, ids: str | None, task: str = "v1"
+) -> None:
     import json
     from datetime import UTC, datetime
 
     from filing_figures.client import predict as run_predict
 
-    recs = _records(split, sample, seed, ids)
-    out = _preds_path(split, run)
-    if split == "test":
+    recs = _records(split, sample, seed, ids, task)
+    out = _preds_path(split, run, task)
+    if split in FINAL_SPLITS:
         log = OUT / "logs" / "test_runs.jsonl"
         log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("a", encoding="utf-8") as f:
             entry = {"ts": datetime.now(UTC).isoformat(timespec="seconds"), "run": run, "n": len(recs)}
+            if task != "v1":  # v1's log lines keep their shape
+                entry |= {"task": task, "split": split}
             f.write(json.dumps(entry | {"config": cfg.__dict__}) + "\n")
     with typer.progressbar(length=len(recs), label=run) as bar:
         stats = run_predict(recs, cfg, out, on_result=lambda _: bar.update(1))
     typer.echo(f"{stats} -> {out}")
-    score(split=split, run=run, sample=sample, seed=seed, ids=ids)
+    score(split=split, run=run, sample=sample, seed=seed, ids=ids, task=task)
 
 
 @app.command()
 def score(
     run: str = typer.Option(..., help="Run name"),
-    split: str = typer.Option("valid", help="train, valid or test"),
+    split: str = typer.Option("valid", help="train, valid, test, ood-valid or ood-test"),
     sample: int = typer.Option(None, help="The same seeded sample the run used"),
     seed: int = typer.Option(0, help="Sampling seed"),
     ids: str = typer.Option(None, help="Comma-separated record ids"),
+    task: str = typer.Option("v1", help=TASK_HELP),
 ) -> None:
     """Score a run: field accuracy with 95% CIs (bootstrap over companies) and error categories."""
     import json
@@ -334,15 +417,15 @@ def score(
     from filing_figures.evaluate import examples, load_predictions, summarize, table
     from filing_figures.evaluate import score as score_rows
 
-    recs = _records(split, sample, seed, ids)
-    preds = load_predictions(_preds_path(split, run))
+    recs = _records(split, sample, seed, ids, task)
+    preds = load_predictions(_preds_path(split, run, task))
     missing = [r["id"] for r in recs if r["id"] not in preds]
     if missing:
         typer.echo(f"WARNING: {len(missing)} of {len(recs)} filings have no prediction (scored as no_response)")
     rows = score_rows(recs, preds)
     summary = summarize(rows)
     typer.echo(f"{run} on {split}: " + table(summary))
-    path = OUT / "scores" / split / f"{run}.json"
+    path = _scores_path(split, run, task)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"summary": summary, "examples": examples(rows)}, indent=1), encoding="utf-8")
 
@@ -351,20 +434,22 @@ def score(
 def compare(
     a: str = typer.Option(..., help="Run A"),
     b: str = typer.Option(..., help="Run B"),
-    split: str = typer.Option("valid", help="train, valid or test"),
+    split: str = typer.Option("valid", help="train, valid, test, ood-valid or ood-test"),
+    task: str = typer.Option("v1", help=TASK_HELP),
 ) -> None:
     """Overall accuracy of B minus A on the filings both runs answered (paired company bootstrap)."""
     from filing_figures.evaluate import compare as compare_rows
     from filing_figures.evaluate import load_predictions
     from filing_figures.evaluate import score as score_rows
 
-    pa, pb = load_predictions(_preds_path(split, a)), load_predictions(_preds_path(split, b))
-    recs = [r for r in _records(split) if r["id"] in pa and r["id"] in pb]
+    pa, pb = load_predictions(_preds_path(split, a, task)), load_predictions(_preds_path(split, b, task))
+    recs = [r for r in _records(split, task=task) if r["id"] in pa and r["id"] in pb]
     gap = compare_rows(score_rows(recs, pa), score_rows(recs, pb))
     typer.echo(
         f"{b} - {a} on {len(recs)} {split} filings: {100 * gap['diff']:+.1f} points "
         f"[{100 * gap['lo']:+.1f}, {100 * gap['hi']:+.1f}], P(B not better) = {gap['p_b_not_better']:.3f}"
     )
+    _write_json(_task_dir(task, OUT / "compare") / split / f"{b}-vs-{a}.json", gap | {"a": a, "b": b, "n": len(recs)})
 
 
 CANDIDATE_TOKENIZERS = ("Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-9B", "google/gemma-4-E4B-it", "Qwen/Qwen3-8B")
@@ -402,38 +487,50 @@ def tokens(
 
 
 HANDCHECK_POOL = Path("labels") / "handcheck_pool.csv"
+# Per task: the split checked, the pool file, the verdicts file (the task's last hand-check file),
+# and the pool's default size (filings, of which random)
+REVIEWS = {
+    "v1": ("test", HANDCHECK_POOL, HANDCHECKS["v1"][-1], 100, 40),
+    "v2": ("ood-test", Path("labels") / "handcheck_v2_pool.csv", HANDCHECKS["v2"][-1], 50, 25),
+}
 
 
 @app.command()
 def review(
     port: int = typer.Option(7862, help="Port on 127.0.0.1"),
-    target: int = typer.Option(100, help="Filings in the pool"),
-    n_random: int = typer.Option(40, help="Of those, a random sample: its fix rate is the answer key's error rate"),
-    new_pool: bool = typer.Option(False, "--new-pool", help="Redraw labels/handcheck_pool.csv"),
+    target: int = typer.Option(None, help="Filings in the pool (v1: 100, v2: 50)"),
+    n_random: int = typer.Option(
+        None, help="Of those, a random sample, whose fix rate is the answer key's error rate (v1: 40, v2: 25)"
+    ),
+    new_pool: bool = typer.Option(False, "--new-pool", help="Redraw the pool file"),
     report: bool = typer.Option(False, "--report", help="Print progress and exit"),
+    task: str = typer.Option("v1", help="v1: the test split, labels/handcheck.csv; v2: ood-test, handcheck_v2.csv"),
 ) -> None:
-    """The hand-check page for the test split's answer key (writes labels/handcheck.csv)."""
+    """The hand-check page for a final split's answer key."""
     from filing_figures.dataset import read_handcheck, read_jsonl
-    from filing_figures.review import Review, build_pool, read_pool, serve, summary, write_pool
+    from filing_figures.review import Review, build_pool, checked_fields, read_pool, serve, summary, write_pool
 
+    split, pool_path, checks_path, default_target, default_random = REVIEWS[task]
     # The XBRL key as built, before any hand-check, so the page shows both side by side
     recs = [
         r
-        for r in read_jsonl(DATA / "build" / "records.jsonl")
-        if "error" not in r and r.get("split") == "test" and r["usable"]
+        for r in read_jsonl(_task_dir(task, DATA / "build") / "records.jsonl")
+        if "error" not in r and r.get("split") == split and r["usable"]
     ]
-    if new_pool or not HANDCHECK_POOL.exists():
-        write_pool(build_pool(recs, target=target, n_random=n_random), HANDCHECK_POOL)
-    pool = read_pool(HANDCHECK_POOL)
-    s = summary(pool, read_handcheck(HANDCHECK))
+    if new_pool or not pool_path.exists():
+        n = default_random if n_random is None else n_random
+        write_pool(build_pool(recs, target=target or default_target, n_random=n, task=task), pool_path)
+    pool = read_pool(pool_path)
+    s = summary(pool, read_handcheck(checks_path), checked_fields(task))
     typer.echo(
         f"{s['filings_done']} of {s['filings']} filings done; verdicts {dict(s['verdicts'])}; "
         f"random sample: {s['random_changed']} of {s['random_fields']} checked fields changed"
     )
     if report:
         return
-    server = serve(Review(recs, pool, HANDCHECK), port)
-    typer.echo(f"hand-check at http://127.0.0.1:{port}/ ; Ctrl+C to stop, then `figures export`")
+    server = serve(Review(recs, pool, checks_path, task), port)
+    then = "figures export" + ("" if task == "v1" else f" --task {task}")
+    typer.echo(f"hand-check at http://127.0.0.1:{port}/ ; Ctrl+C to stop, then `{then}`")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -445,11 +542,12 @@ def stub(
     split: str = typer.Option("valid", help="Whose filings it recognises"),
     mode: str = typer.Option("gold", help="gold, prior or garbage"),
     port: int = typer.Option(8001, help="Port on 127.0.0.1"),
+    task: str = typer.Option("v1", help=TASK_HELP),
 ) -> None:
     """A stand-in model server for testing the harness (see stub.py)."""
     from filing_figures.stub import StubServer
 
-    server = StubServer(_records(split), mode, port=port)
+    server = StubServer(_records(split, task=task), mode, port=port)
     typer.echo(f"stub ({mode}) at {server.url}; Ctrl+C to stop")
     try:
         server.serve_forever()
@@ -532,7 +630,7 @@ def _gpu_name() -> str:
 
 
 @app.command()
-def doctor() -> None:
+def doctor(task: str = typer.Option("v1", help=TASK_HELP)) -> None:
     """Check the machine before GPU work: GPU, CUDA, data, HF token, disk, installed packages."""
     import importlib.util
     import shutil
@@ -562,10 +660,10 @@ def doctor() -> None:
         if cuda:
             detail += f", {torch.cuda.get_device_name(0)}, bf16 {torch.cuda.is_bf16_supported()}"
         check("torch sees the GPU", cuda, detail, critical=bool(smi))
-    for split in ("train", "valid", "test"):
-        p = DATA / "export" / f"{split}.jsonl"
+    for split in TASK_SPLITS[task]:
+        p = _task_dir(task, DATA / "export") / f"{split}.jsonl"
         n = sum(1 for line in p.open(encoding="utf-8") if line.strip()) if p.exists() else 0
-        check(f"data: {split}", n > 0, f"{n} filings in {p}")
+        check(f"data: {task} {split}", n > 0, f"{n} filings in {p.as_posix()}")
     if os.environ.get("HF_TOKEN"):
         try:
             from huggingface_hub import HfApi
@@ -576,7 +674,7 @@ def doctor() -> None:
             check("HF token", False, type(e).__name__)
     else:
         check("HF token", False, "HF_TOKEN is not set")
-    for pkg in ("unsloth", "llmcompressor", "vllm"):
+    for pkg in ("unsloth", "llmcompressor", "vllm", "trl", "peft"):
         found = importlib.util.find_spec(pkg) is not None
         check(f"package {pkg}", True, "installed" if found else "not in this environment", critical=False)
     free = shutil.disk_usage(Path.cwd()).free / 1e9
@@ -585,12 +683,12 @@ def doctor() -> None:
 
 
 @app.command("fetch-data")
-def fetch_data() -> None:
-    """Download the exported splits from the Hugging Face dataset (as last pushed)."""
-    from filing_figures.runs import fetch_dataset
+def fetch_data(task: str = typer.Option("v1", help=TASK_HELP)) -> None:
+    """Download the exported splits from the task's Hugging Face dataset (as last pushed)."""
+    from filing_figures.runs import DATASETS, fetch_dataset
 
-    for p in fetch_dataset(DATA / "export"):
-        typer.echo(f"{p}: {sum(1 for line in p.open(encoding='utf-8') if line.strip())} filings")
+    for p in fetch_dataset(_task_dir(task, DATA / "export"), DATASETS[task]):
+        typer.echo(f"{p.as_posix()}: {sum(1 for line in p.open(encoding='utf-8') if line.strip())} filings")
 
 
 @app.command("vllm-predict")
@@ -605,7 +703,9 @@ def vllm_predict(
     max_tokens: int = typer.Option(None, help="Output cap (default 2048, or 16000 when thinking)"),
     workers: int = typer.Option(64, help="Requests in flight"),
     port: int = typer.Option(8000),
-    final: bool = typer.Option(False, help="Allow the test split; the run is logged"),
+    final: bool = typer.Option(False, help="Allow the test and ood-test splits; the run is logged"),
+    task: str = typer.Option("v1", help=TASK_HELP),
+    splits: str = typer.Option(None, help="Several splits with one server start, e.g. valid,ood-valid"),
 ) -> None:
     """Serve a model with vLLM, ask it about each filing, score it, stop the server. (serve environment)"""
     import time
@@ -613,16 +713,13 @@ def vllm_predict(
     from filing_figures.client import Config
     from filing_figures.vllm_server import MAX_MODEL_LEN, THINKING_MAX_MODEL_LEN, running
 
-    if split == "test" and not final:
-        raise typer.BadParameter("the test split is for the final runs only: pass --final")
+    todo = splits.split(",") if splits else [split]
+    for s in todo:
+        _check_split(s, final)
     t0 = time.time()
     max_len = THINKING_MAX_MODEL_LEN if thinking else MAX_MODEL_LEN
-    with running(
-        model, run, OUT / "logs" / "vllm" / f"{run}.log", port=port, max_model_len=max_len, thinking=thinking
-    ) as (
-        url,
-        stats,
-    ):
+    log = _task_dir(task, OUT / "logs" / "vllm") / f"{run}.log"
+    with running(model, run, log, port=port, max_model_len=max_len, thinking=thinking) as (url, stats):
         startup_s = time.time() - t0
         cfg = Config(
             endpoint=url,
@@ -634,9 +731,11 @@ def vllm_predict(
             timeout=1800.0,  # a long thinking answer, queued behind 63 others
         )
         t1 = time.time()
-        _predict_and_score(cfg, split, run, sample, seed, None)
-        info = {"model": model, "split": split, "gpu": _gpu_name(), "startup_s": round(startup_s, 1)}
-        _write_json(OUT / "serve" / f"{run}.json", info | {"predict_s": round(time.time() - t1, 1), **stats})
+        for s in todo:
+            _predict_and_score(cfg, s, run, sample, seed, None, task)
+        info = {"model": model, "split": ",".join(todo), "gpu": _gpu_name(), "startup_s": round(startup_s, 1)}
+        out = _task_dir(task, OUT / "serve") / f"{run}.json"
+        _write_json(out, info | {"predict_s": round(time.time() - t1, 1), **stats})
 
 
 @app.command()
@@ -649,9 +748,11 @@ def train(
     lr: float = typer.Option(2e-4),
     grad_accum: int = typer.Option(16, help="Filings per optimizer step"),
     max_steps: int = typer.Option(-1, help="> 0: a timing run (check stage)"),
+    max_seq_length: int = typer.Option(8192, help="Longer filings are dropped (v2: 9216 keeps every train filing)"),
     four_bit: bool | None = typer.Option(
         None, "--four-bit/--bf16", help="Default: QLoRA where supported (train.FOUR_BIT)"
     ),
+    task: str = typer.Option("v1", help=TASK_HELP),
 ) -> None:
     """LoRA fine-tune on the train split; adapters every half epoch in outputs/train/<name>. (train environment)"""
     from filing_figures.train import TrainConfig
@@ -667,10 +768,80 @@ def train(
         lr=lr,
         grad_accum=grad_accum,
         max_steps=max_steps,
+        max_seq_length=max_seq_length,
         load_in_4bit=four_bit,
     )
-    meta = run_train(cfg, _records("train"), _records("valid"))
+    meta = run_train(cfg, _records("train", task=task), _records("valid", task=task))
     typer.echo({k: meta[k] for k in ("steps", "seconds_per_step", "peak_gpu_gib", "train_loss", "dropped_too_long")})
+
+
+RL_TASK = typer.Option(..., help=TASK_HELP)
+
+
+@app.command("rl-filter")
+def rl_filter(
+    init: str = typer.Option(..., help="Starting model: a repo or a merged folder"),
+    name: str = typer.Option(..., help="Output folder: outputs/rl-filter/<name>"),
+    task: str = RL_TASK,
+    split: str = typer.Option("train"),
+    sample: int = typer.Option(None, help="A seeded sample of N filings (check stage)"),
+    seed: int = typer.Option(0),
+    group: int = typer.Option(8, help="Answers per filing"),
+    gpu_mem: float = typer.Option(0.9, help="vLLM's share of GPU memory"),
+) -> None:
+    """Sample answers at temperature 1 and score them: GRPO's difficulty filter. (rl environment)"""
+    from filing_figures import reward
+    from filing_figures.rl import sample_groups
+
+    _check_split(split, final=False)  # test and ood-test are never sampled
+    recs = _records(split, sample=sample, seed=seed, task=task)
+    groups = sample_groups(init, recs, OUT / "rl-filter" / name, n=group, seed=seed, gpu_mem=gpu_mem)
+    typer.echo(reward.filter_summary(groups))
+
+
+@app.command("train-rl")
+def train_rl(
+    init: str = typer.Option(..., help="Starting model: Qwen/Qwen3.5-4B or a merged SFT folder"),
+    name: str = typer.Option(..., help="Run name: adapters in outputs/train/<name>"),
+    task: str = RL_TASK,
+    keep: Path = typer.Option(None, help="An rl-filter filter.jsonl: train on the filings it keeps"),
+    sample: int = typer.Option(None, help="A seeded sample of N train filings (check stage)"),
+    seed: int = typer.Option(0),
+    steps: int = typer.Option(150),
+    saves: int = typer.Option(6, help="Adapters saved, evenly spaced"),
+    stack: str = typer.Option("trl", help="trl (rl environment) or unsloth (rl-unsloth)"),
+    lr: float = typer.Option(1e-5),
+    vllm_mem: float = typer.Option(None, help="vLLM's share of GPU memory (default: rl.VLLM_MEM)"),
+) -> None:
+    """GRPO with the filing reward; adapters in outputs/train/<name>. (rl or rl-unsloth environment)"""
+    from filing_figures import reward
+    from filing_figures.rl import RLConfig, read_filter
+    from filing_figures.rl import train_rl as run
+
+    recs = _records("train", sample=sample, seed=seed, task=task)
+    if keep:
+        kept = set(reward.keep(read_filter(keep)))
+        recs = [r for r in recs if r["id"] in kept]
+    cfg = RLConfig(init=init, out=OUT / "train" / name, stack=stack, steps=steps, saves=saves, lr=lr, vllm_mem=vllm_mem)
+    if len(recs) < cfg.prompts_per_step:
+        raise typer.BadParameter(f"{len(recs)} filings to train on; a step needs {cfg.prompts_per_step}")
+    meta = run(cfg, recs)
+    shown = ("steps", "train_filings", "seconds_per_step", "gpu_used_gib_max", "dropped_too_long")
+    typer.echo({k: meta[k] for k in shown})
+
+
+@app.command("check-report")
+def check_report(
+    grpo_steps: int = typer.Option(150, help="GRPO steps planned for the real run"),
+    price: float = typer.Option(None, help="The pod's $/hour, for the cost"),
+) -> None:
+    """Go/no-go for GRPO and the hours of sft2 and grpo, from the v2 check stage's runs."""
+    from filing_figures.check_report import report, samples
+
+    lines, ok = report(OUT, grpo_steps, price)
+    for line in [*lines, "", *samples(OUT)]:
+        typer.echo(line)
+    raise typer.Exit(0 if ok else 1)
 
 
 @app.command()
@@ -693,10 +864,10 @@ def checkpoints(name: str = typer.Option(..., help="Run name of a `train` run"))
         typer.echo(p.as_posix())
 
 
-def _summary(split: str, run: str) -> dict | None:
+def _summary(split: str, run: str, task: str = "v1") -> dict | None:
     import json
 
-    p = OUT / "scores" / split / f"{run}.json"
+    p = _scores_path(split, run, task)
     return json.loads(p.read_text(encoding="utf-8"))["summary"] if p.exists() else None
 
 
@@ -714,20 +885,31 @@ def pick_base(models: str = typer.Option(",".join(CANDIDATE_TOKENIZERS), help="C
 
 
 @app.command("pick-checkpoint")
-def pick_checkpoint(name: str = typer.Option(..., help="Run name of a `train` run")) -> None:
+def pick_checkpoint(
+    name: str = typer.Option(..., help="Run name of a `train` or `train-rl` run"),
+    task: str = typer.Option("v1", help="v1 picks on valid; v2 on valid and ood-valid pooled"),
+) -> None:
     """The best checkpoint on validation (runs <name>-step<N>); writes outputs/train/<name>/best.json."""
     from filing_figures.picks import pick_checkpoint as choose
+    from filing_figures.picks import pooled
     from filing_figures.train import checkpoints as find
 
     paths = {int(p.name.split("-")[1]): p for p in find(OUT / "train" / name)}
-    scores = {step: s for step in paths if (s := _summary("valid", f"{name}-step{step}"))}
+    scores = {}
+    for step in paths:
+        parts = [_summary(s, f"{name}-step{step}", task) for s in PICK_SPLITS[task]]
+        if all(parts):  # a step missing one split's score isn't compared
+            scores[step] = parts[0] if len(parts) == 1 else pooled(parts)
     step = choose(scores)
     best = {
         "step": step,
         "checkpoint": paths[step].as_posix(),
         "run": f"{name}-step{step}",
+        "splits": list(PICK_SPLITS[task]),
         "overall_pct": {s: round(100 * v["overall"]["value"], 2) for s, v in sorted(scores.items())},
     }
+    if task == "v1":  # v1's best.json keeps its shape
+        del best["splits"]
     _write_json(OUT / "train" / name / "best.json", best)
     typer.echo(best)
 

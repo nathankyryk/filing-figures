@@ -8,7 +8,7 @@ import urllib.request
 import pytest
 
 from filing_figures.dataset import read_handcheck
-from filing_figures.labels import FIELD_NAMES
+from filing_figures.labels import FIELD_NAMES, field_names
 from filing_figures.review import Review, build_pool, parse_printed, review_reasons, serve
 
 END = "2024-12-31"
@@ -112,3 +112,71 @@ def test_server_guards(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+# ---- task v2: the ood-test hand-check --------------------------------------------------------
+
+V2_NAMES = field_names("v2")
+
+
+def gold(value, tag, scale="millions", end=END, displayed="1"):
+    return {"value": value, "scale": scale, "period_end": end, "fiscal_year": 2024, "tag": tag, "displayed": displayed}
+
+
+def record_v2(
+    i: int, equity_tag="us-gaap:StockholdersEquity", capex_tag="us-gaap:PaymentsToAcquirePropertyPlantAndEquipment"
+):
+    rec = record(i)
+    rec["gold"] = dict.fromkeys(V2_NAMES)
+    rec["gold"] |= {
+        "net_income": gold(100e6, "us-gaap:NetIncomeLoss", displayed="100"),
+        "revenue_prior": gold(900e6, "us-gaap:Revenues", end="2023-12-31", displayed="900"),
+        "eps_basic": gold(1.25, "us-gaap:EarningsPerShareBasic", scale="units", displayed="1.25"),
+        "equity": gold(500e6, equity_tag, displayed="500"),
+        "capex": gold(40e6, capex_tag, displayed="40"),
+        "fcf": gold(60e6, "derived", displayed=None),
+    }
+    rec["flags"] = {n: [] for n in V2_NAMES}
+    rec["context_facts"] += [
+        {"tag": "us-gaap:Revenues", "unit": "USD", "start": "2023-01-01", "end": "2023-12-31", "val": 900e6},
+        {"tag": "us-gaap:Revenues", "unit": "USD", "start": "2024-01-01", "end": END, "val": 1000e6},
+    ]
+    return rec
+
+
+def test_v2_traps_flag_a_filing_and_v1_ignores_them():
+    nci = "us-gaap:StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"
+    rec = record_v2(0, equity_tag=nci, capex_tag="us-gaap:PaymentsToAcquireProductiveAssets")
+    assert review_reasons(rec, "v2") == ["equity:with_nci", "capex:fallback_tag"]
+    assert review_reasons(record_v2(1), "v2") == []
+    assert review_reasons(rec) == []  # v1: six fields, no traps
+
+
+def test_v2_pool_is_25_random_and_25_flagged():
+    nci = "us-gaap:StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"
+    recs = [record_v2(i) for i in range(60)] + [record_v2(100 + i, equity_tag=nci) for i in range(40)]
+    pool = build_pool(recs, target=50, n_random=25, task="v2")
+    assert pool == build_pool(recs, target=50, n_random=25, task="v2")
+    assert len(pool) == len({p["id"] for p in pool}) == 50
+    assert sum(p["reason"].startswith("random") for p in pool) == 25
+    flagged = [p for p in pool if not p["reason"].startswith("random")]
+    assert len(flagged) == 25 and all(p["reason"] == "equity:with_nci" for p in flagged)
+
+
+def test_v2_page_checks_eleven_fields_and_fcf_follows_its_parts(tmp_path):
+    rv = Review([record_v2(0)], [{"order": 0, "id": "EXM-0", "reason": "random"}], tmp_path / "hc_v2.csv", "v2")
+    assert rv.pool_view()[0]["fields"] == 11
+    view = rv.record_view("EXM-0")
+    assert [f["name"] for f in view["fields"]] == list(V2_NAMES)
+    by_name = {f["name"]: f for f in view["fields"]}
+    assert by_name["eps_basic"]["per_share"] and not by_name["equity"]["per_share"]
+    assert by_name["fcf"]["parts"] == ["operating_cash_flow", "capex"]
+    assert [f["end"] for f in by_name["revenue_prior"]["related"]] == ["2023-12-31"]  # the year before
+    with pytest.raises(ValueError, match="follows its parts"):
+        rv.save({"id": "EXM-0", "field": "fcf", "verdict": "ok"})
+    rv.save({"id": "EXM-0", "field": "eps_basic", "verdict": "fix", "printed": "1.27"})
+    rv.save({"id": "EXM-0", "field": "revenue_prior", "verdict": "fix", "printed": "905", "period_end": "2023-12-31"})
+    checks = read_handcheck(tmp_path / "hc_v2.csv")
+    assert checks[("EXM-0", "eps_basic")]["value"] == "1.27" and checks[("EXM-0", "eps_basic")]["scale"] == "units"
+    assert checks[("EXM-0", "revenue_prior")]["value"] == "905000000"
+    assert rv.summary()["verdicts"] == {"fix": 2}

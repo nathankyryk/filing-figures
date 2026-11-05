@@ -5,9 +5,13 @@
 #        grep '^HF_TOKEN=' .env | ssh -p <PORT> root@<IP> 'umask 077; mkdir -p /workspace; cat > /workspace/.env'
 #   2. Set up:
 #        ssh -p <PORT> root@<IP> 'curl -fsSL https://raw.githubusercontent.com/nathankyryk/filing-figures/master/scripts/setup_pod.sh | bash'
+#      Task v2 (GRPO), from its branch:
+#        ssh -p <PORT> root@<IP> 'curl -fsSL https://raw.githubusercontent.com/nathankyryk/filing-figures/task-v2/scripts/setup_pod.sh | BRANCH=task-v2 TASK=v2 ENVS="train serve rl" bash'
 #
 # Safe to re-run: each step checks what is already there. ENVS="serve" sets up fewer environments
-# (default: all three). Ends with `figures doctor`; a non-zero exit means something needs attention.
+# (default: train quant serve; the GRPO stages use rl, or rl-unsloth for the fallback). TASK=v2
+# fetches and checks the v2 dataset. Ends with `figures doctor`; a non-zero exit means something
+# needs attention.
 
 set -euo pipefail
 
@@ -16,6 +20,8 @@ UV_VERSION="0.13.1"  # same uv that wrote uv.lock
 WORKSPACE="${WORKSPACE:-/workspace}"
 REPO_DIR="$WORKSPACE/filing-figures"
 ENVS="${ENVS:-train quant serve}"
+BRANCH="${BRANCH:-master}"
+TASK="${TASK:-v1}"
 
 mkdir -p "$WORKSPACE/logs"
 LOG="$WORKSPACE/logs/setup_$(date +%Y%m%d_%H%M%S).log"
@@ -44,9 +50,11 @@ echo "git, curl and tmux present"
 
 step "Repository"
 if [ -d "$REPO_DIR/.git" ]; then
-  git -C "$REPO_DIR" pull --ff-only
+  git -C "$REPO_DIR" fetch origin "$BRANCH"
+  git -C "$REPO_DIR" checkout "$BRANCH"
+  git -C "$REPO_DIR" pull --ff-only origin "$BRANCH"
 else
-  git clone "$REPO_URL" "$REPO_DIR"
+  git clone --branch "$BRANCH" "$REPO_URL" "$REPO_DIR"
 fi
 git -C "$REPO_DIR" log --oneline -1
 # shellcheck source=scripts/pod_env.sh
@@ -65,7 +73,8 @@ uv --version
 
 for extra in $ENVS; do
   step "Environment: $extra (exactly as uv.lock)"
-  UV_PROJECT_ENVIRONMENT="$(venv_dir "$extra")" uv sync --frozen --no-dev --extra "$extra"
+  # shellcheck disable=SC2046 - dev_flag's output is meant to split into flag and value
+  UV_PROJECT_ENVIRONMENT="$(venv_dir "$extra")" uv sync --frozen $(dev_flag "$extra") --extra "$extra"
   in_env "$extra" python - <<'EOF'
 import torch
 assert torch.cuda.is_available(), "PyTorch cannot see the GPU"
@@ -75,12 +84,12 @@ done
 
 step "Dataset (from Hugging Face)"
 first=${ENVS%% *}
-in_env "$first" figures fetch-data
+in_env "$first" figures fetch-data --task "$TASK"
 df -h "$WORKSPACE" | tail -n 1
 
 step "figures doctor"
-if in_env "$first" figures doctor; then
-  printf '\nReady. Next: bash scripts/run_gpu_jobs.sh check   (log: %s)\n' "$LOG"
+if in_env "$first" figures doctor --task "$TASK"; then
+  printf '\nReady. Next: TASK=%s bash scripts/run_gpu_jobs.sh check   (log: %s)\n' "$TASK" "$LOG"
 else
   printf '\nNot ready: fix the !! lines above, then re-run this script. (log: %s)\n' "$LOG"
   exit 1

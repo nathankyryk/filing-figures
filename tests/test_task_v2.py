@@ -272,6 +272,12 @@ def test_v2_prompt_defines_every_field_and_its_example_matches_the_schema():
     assert prompts.prompt_version("v2") == "v5"
 
 
+def test_v2_prompt_is_frozen():
+    # Tuned on valid (Nov 5, rounds in outputs/prompt_v5_notes.md), then frozen before any GPU run:
+    # a change needs a new prompt version
+    assert hashlib.sha256(prompts.SYSTEM_V2.encode()).hexdigest()[:16] == "560307fb3d4ff517"
+
+
 def v2_gold():
     gold = copy.deepcopy(GOLD)
     extra = {

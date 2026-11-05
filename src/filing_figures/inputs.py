@@ -175,7 +175,8 @@ def _inline_text(el: etree._Element) -> str:
     """An element's own text, leaving out child blocks and tables (their tails stay)."""
     parts = [el.text or ""]
     for c in el:
-        if _local(c) not in BLOCK_TAGS | {"table"}:
+        name = _local(c)  # "" for a comment: it has no text to keep, only its tail
+        if name and name not in BLOCK_TAGS | {"table"}:
             parts.append("".join(c.itertext()))
         parts.append(c.tail or "")
     return _norm("".join(parts))

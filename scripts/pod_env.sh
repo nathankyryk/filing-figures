@@ -37,6 +37,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # stops; run_gpu_jobs.sh re-creates missing environments from the uv cache (~1 min each).
 export VENV_ROOT="${VENV_ROOT:-/root/venvs}"
 venv_dir() { echo "$VENV_ROOT/$1"; }
+# The rl environment also gets the dev tools: the check stage runs its pod tests there
+dev_flag() { if [ "$1" = rl ]; then echo "--group dev"; else echo "--no-dev"; fi; }
 
 #   in_env train figures train ...
 in_env() {

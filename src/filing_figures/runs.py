@@ -9,6 +9,8 @@ from pathlib import Path
 
 RUNS_REPO = "kyryk/filing-figures-runs"
 DATASET_REPO = "kyryk/filing-figures"
+# One dataset repo per task: v1's is public; v2's stays private until its results are out
+DATASETS = {"v1": DATASET_REPO, "v2": "kyryk/filing-figures-v2"}
 
 
 def _api():
@@ -40,12 +42,12 @@ def download(patterns: list[str], repo: str = RUNS_REPO, local_dir: Path = Path(
     return snapshot_download(repo, allow_patterns=patterns, local_dir=str(local_dir), token=os.environ.get("HF_TOKEN"))
 
 
-def fetch_dataset(out: Path = Path("data/export")) -> list[Path]:
+def fetch_dataset(out: Path = Path("data/export"), repo: str = DATASET_REPO) -> list[Path]:
     """The exported splits, as last pushed by `figures push`."""
     from huggingface_hub import snapshot_download
 
     snapshot_download(
-        DATASET_REPO,
+        repo,
         repo_type="dataset",
         allow_patterns=["*.jsonl"],
         local_dir=str(out),

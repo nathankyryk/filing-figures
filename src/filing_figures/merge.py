@@ -70,7 +70,7 @@ def merge_adapter(base: str, adapter_dir: Path, out_dir: Path) -> dict:
     adapter = load_file(str(adapter_dir / "adapter_model.safetensors"))
     modules = lora_modules(list(adapter))
 
-    src = Path(snapshot_download(base))
+    src = Path(base) if Path(base).is_dir() else Path(snapshot_download(base))  # a merged folder, or a repo
     shards = sorted(src.glob("*.safetensors"))
     where: dict[str, Path] = {}
     for shard in shards:
@@ -82,7 +82,7 @@ def merge_adapter(base: str, adapter_dir: Path, out_dir: Path) -> dict:
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True)
     for p in src.iterdir():  # everything but the weights, unchanged
-        if p.is_file() and p.suffix != ".safetensors":
+        if p.is_file() and p.suffix != ".safetensors" and p.name != "filing_figures.json":  # written last
             shutil.copy2(p.resolve(), out_dir / p.name)
     merged = 0
     for shard in shards:

@@ -3,7 +3,8 @@
 - Base model: the best overall field accuracy. Any candidate whose accuracy is inside the best
   one's 95% interval counts as a tie, and the smallest such model wins (cheaper to serve).
 - Checkpoint: the best overall field accuracy on all validation filings; a tie goes to the
-  earlier checkpoint.
+  earlier checkpoint. Task v2 pools valid and ood-valid (every scored field of both counts once),
+  for every run alike: SFT, GRPO and SFT->GRPO.
 """
 
 from __future__ import annotations
@@ -29,3 +30,11 @@ def pick_checkpoint(summaries: dict[int, dict]) -> int:
     if not summaries:
         raise ValueError("no checkpoint scores")
     return max(sorted(summaries), key=lambda s: summaries[s]["overall"]["value"])
+
+
+def pooled(summaries: list[dict]) -> dict:
+    """Overall accuracy over several splits' scored fields together (task v2 picks on valid and
+    ood-valid pooled): each split's value is correct / n, so the pool is a weighted mean."""
+    n = sum(s["overall"]["n"] for s in summaries)
+    correct = sum(s["overall"]["value"] * s["overall"]["n"] for s in summaries)
+    return {"overall": {"value": correct / n if n else float("nan"), "n": n}}

@@ -15,9 +15,7 @@ from filing_figures.dataset import build_record
 from filing_figures.edgar import Edgar
 from filing_figures.evaluate import categorize, field_prediction, parse_answer
 from filing_figures.labels import FIELD_NAMES
-from filing_figures.universe import list_10ks
-
-TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+from filing_figures.universe import TICKERS_URL, list_10ks
 
 
 def find_cik(edgar: Edgar, ticker: str) -> int:
