@@ -8,7 +8,10 @@ Every answer is checked against the XBRL data each company filed with the SEC, s
 - **Ties Qwen3.5-397B** (98.7%) and comes within 1.2 points of **Claude Opus 5.5** (100%).
 - **$0.07 per 1,000 filings** served in 4-bit on one RTX 5090, vs $3.66 for Qwen3.5-397B and $29.84 for Opus.
 
+**Part 2** makes it harder: 12 figures instead of 6, tested on mid-size companies from a year the model never saw, with reinforcement learning (GRPO) next to supervised fine-tuning. The fine-tuned 4B gets **99.0%** there and beats Qwen3.5-397B. GRPO reaches **98.2%** without ever seeing a correct answer, but doesn't beat supervised fine-tuning. [Read part 2](#part-2-12-figures-mid-cap-companies-and-grpo).
+
 **Links:** [browse every answer](https://huggingface.co/spaces/kyryk/filing-figures) · [model](https://huggingface.co/kyryk/filing-figures-qwen3.5-4b-nvfp4) · [LoRA adapter](https://huggingface.co/kyryk/filing-figures-qwen3.5-4b-lora) · [dataset](https://huggingface.co/datasets/kyryk/filing-figures)
+**Part 2:** [SFT adapter](https://huggingface.co/kyryk/filing-figures-v2-qwen3.5-4b-sft-lora) · [GRPO adapter](https://huggingface.co/kyryk/filing-figures-v2-qwen3.5-4b-grpo-lora) · [dataset](https://huggingface.co/datasets/kyryk/filing-figures-v2)
 
 ![figures extract reading NVIDIA's FY2026 10-K: all six figures match XBRL](docs/demo.gif)
 
@@ -140,14 +143,69 @@ Its 14 wrong figures on test (of 1,186) come from just **4 companies**, and almo
 - **Data coverage:** non-financial S&P 500 companies, 10-Ks from 2019–2024 only.
 - **The large API models may have seen these filings in training.** That wasn't tested.
 
+## Part 2: 12 figures, mid-cap companies and GRPO
+
+Part 1 left little headroom, so part 2 makes the task harder and asks a different question: **does reinforcement learning generalize better than supervised fine-tuning** to companies unlike the ones it trained on?
+
+**What changed:**
+- **12 figures per filing.** New: basic EPS, cash, stockholders' equity, prior-year revenue, capital expenditures, and free cash flow (operating cash flow minus capex, which the model has to compute).
+- **A second test set, out of distribution:** FY2025 10-Ks from S&P MidCap 400 companies. They're smaller companies, from a year after all the training data. Split by company into mid-cap validation (75 filings) and mid-cap test (119).
+- **Training, validation and S&P 500 test** use part 1's companies (934, 214 and 207 filings).
+- **The answer key was checked by hand again:** 50 mid-cap test filings, 550 figures. No value was wrong. 10 figures the key had left blank were filled in, mostly where a company used an XBRL tag the labeler doesn't know.
+
+**Two ways to train the same Qwen3.5-4B:**
+- **SFT** learns from the answer key's JSON, with part 1's recipe (LoRA rank 16, 3 epochs, 25 minutes on an H100).
+- **GRPO** never sees an answer. For each filing it writes 8 answers, scores each one against the key with the test's own rule (the share of figures right), and learns from how the 8 compare. LoRA rank 32, learning rate 1e-5, 8 filings per step, no KL penalty; 72 steps, 2.4 hours on an H100.
+
+Each picked its checkpoint on both validation sets together. Each test set was run once.
+
+### Results
+
+Mid-cap test: 119 filings from 119 companies, 1,372 figures.
+
+| Model | Figures right | Filings with all 12 right |
+|---|---|---|
+| Qwen3.5-4B, no fine-tuning | 86.2% | 55% |
+| Qwen3.5-4B, GRPO | 98.2% | 85% |
+| Qwen3.5-397B | 98.3% | 88% |
+| **Qwen3.5-4B, SFT** | **99.0%** | **92%** |
+| Claude Opus 5.5 | 99.3% | 96% |
+
+On the S&P 500 test set (207 filings, 2,324 figures): 95.4% before fine-tuning, 98.4% with GRPO, 98.8% with SFT.
+
+| Comparison, with 95% intervals | Gap (points) |
+|---|---|
+| SFT vs no fine-tuning, mid-cap | **+12.8** [+8.7, +17.2] |
+| GRPO vs SFT, mid-cap | **−0.8** [−1.5, −0.1] |
+| GRPO vs SFT, S&P 500 | **−0.4** [−0.9, −0.04] |
+| SFT vs Qwen3.5-397B, mid-cap | **+0.7** [+0.1, +1.3] |
+| Claude Opus 5.5 vs SFT, mid-cap | **+0.4** [+0.1, +0.8] |
+
+### What I found
+
+- **GRPO didn't generalize better.** It trails SFT on both test sets. Still, it got 94% of SFT's mid-cap gain from a reward alone, and it ties Qwen3.5-397B (−0.1 [−0.7, +0.4]), a model about 100× its size.
+- **Mid-caps are where fine-tuning pays.** The base model falls from 95.4% to 86.2% on them, mostly by writing numbers 10× too big or too small (142 of its 190 misses). The fine-tuned models made that mistake once between them.
+- **GRPO ran out of signal.** It only learns from filings where its 8 answers disagree. That was 78% of filings in the first 12 steps and 5% by the end, as the model grew sure of itself. The best checkpoint came at step 48, and nothing improved after it.
+- **GRPO falls short on conventions,** like which line counts as capex. On mid-caps it trails SFT on prior-year revenue (95.8% vs 98.3%), capex (94.3% vs 96.2%) and free cash flow (93.3% vs 97.1%). SFT is shown the convention 934 times; GRPO has to stumble on it and get rewarded.
+
+Getting GRPO to run with vLLM on Qwen3.5 (TRL 1.17.1, vLLM sharing the GPU) took two fixes:
+- **Weight sync.** TRL sends the LoRA weights to vLLM by merging them into the bf16 base weights and unmerging after, which slowly changes the frozen base ([TRL #7427](https://github.com/huggingface/trl/pull/7427), open). I replaced it with a merge computed in fp32 that never touches the base. A test checks the base stays bit-identical.
+- **Weight names.** Training Qwen3.5's text-only class gives names vLLM rejects ([vLLM #36275](https://github.com/vllm-project/vllm/issues/36275)), so training uses the vision-language class and vLLM runs language-only.
+
+A short check run gated the overnight run: vLLM's and the trainer's log-probabilities agreed to 0.0005 on average (the gate was 0.1).
+
+**Not tried, to keep costs down:** GRPO starting from the SFT model, and a GRPO run with more answers per filing or a higher temperature to keep the answers disagreeing longer.
+
 ## Cost of the whole project
 
 | Item | Cost |
 |---|---|
-| GPU rental (RTX 5090, Runpod): setup checks, bake-off, training, quantization, speed tests, test run | ~$4.50 |
-| OpenRouter: prompt tuning and Qwen3.5-397B | ~$1.20 |
-| OpenRouter: Claude Opus 5.5 on the test set | $6.18 |
-| **Total** | **~$12** |
+| Part 1, GPU rental (RTX 5090, Runpod): setup checks, bake-off, training, quantization, speed tests, test run | ~$4.50 |
+| Part 1, OpenRouter: prompt tuning and Qwen3.5-397B | ~$1.20 |
+| Part 1, OpenRouter: Claude Opus 5.5 on the test set | $6.18 |
+| Part 2, GPU rental: SFT, GRPO and checkpoint scoring on an H100; the test run on an RTX 5090 | ~$21 |
+| Part 2, OpenRouter: prompt tuning, Qwen3.5-397B and Claude Opus 5.5 on the mid-cap test | $5.70 |
+| **Total** | **~$39** |
 
 ## Try it on any 10-K
 
@@ -201,6 +259,13 @@ uv run figures review
 
 # Build the results viewer's data (space/) from the test predictions
 uv run figures space
+
+# Part 2: add the mid-cap companies, then build the 12-figure task
+uv run figures ood-universe
+uv run figures download
+uv run figures build --task v2
+uv run figures export --task v2
+uv run figures review --task v2
 ```
 
 The GPU stages run on a rented Linux GPU with CUDA 13 (an RTX 5090 here). Each stage uploads its results to a Hugging Face repo, then stops the pod:
@@ -214,6 +279,11 @@ ssh -p <PORT> root@<IP> 'curl -fsSL https://raw.githubusercontent.com/nathankyry
 bash scripts/run_gpu_jobs.sh check                                # ~50 min: every step once on tiny inputs
 GPU_PRICE=1.19 bash scripts/run_gpu_jobs.sh all                   # ~3 h: bake-off, training, quantization, speed
 HANDCHECK_DONE=1 QUANT=nvfp4 bash scripts/run_gpu_jobs.sh test    # ~20 min: the one test run
+
+# Part 2 (set the pod up with TASK=v2 ENVS="train serve rl" in front of `bash`)
+TASK=v2 bash scripts/run_gpu_jobs.sh check                          # tiny SFT and GRPO runs, go/no-go gates
+CHAIN="sft2 grpo" GRPO_STEPS=72 bash scripts/run_gpu_jobs.sh chain  # ~4 h on an H100
+HANDCHECK_DONE=1 bash scripts/run_gpu_jobs.sh test2                 # ~25 min: the one test run
 ```
 
 ## Code
@@ -228,10 +298,11 @@ HANDCHECK_DONE=1 QUANT=nvfp4 bash scripts/run_gpu_jobs.sh test    # ~20 min: the
 | `sft.py`, `train.py`, `merge.py` | Training examples, LoRA training, merging the adapter into the model |
 | `quantize.py`, `vllm_server.py`, `bench.py` | 4-bit and 8-bit versions, serving, speed tests |
 | `extract.py`, `space.py` | `figures extract` (any 10-K, any model); the results viewer's data |
+| `reward.py`, `rl.py`, `check_report.py` | Part 2: the reward and the filter, GRPO training with vLLM, the go/no-go check |
 | `scripts/` | Pod setup and the GPU stages |
 | `space/` | The results viewer (a static Hugging Face Space) |
 | `hf/` | The Hugging Face dataset and model cards |
-| `labels/handcheck.csv` | The hand-check verdicts |
+| `labels/handcheck.csv`, `handcheck_v2.csv` | The hand-check verdicts (part 1, part 2) |
 
 ## License
 
